@@ -7,7 +7,7 @@ output: pdf_document
 ```{r include=false}
 library(tidyverse)
 ```
-## Pre-processing 
+## Pre-processing (follow the steps of Wang et al.)
 
 This is expression data profiling by array of human lymphoblastoid cell lines derived from 400 children from families recruited through a proband with asthma
 
@@ -71,7 +71,7 @@ Remove low-expression probes (biological QC), then do variance-based filtering
 ```{r}
 probe_means <- rowMeans(expr)
 
-# Remove bottom 40% of probes by mean expression (smilar to Wang et al.)
+# Remove bottom 40% of probes by mean expression (similar to Wang et al.)
 mean_cutoff <- quantile(probe_means, 0.40) 
 expr_qc <- expr[probe_means > mean_cutoff, ]
 
@@ -85,31 +85,92 @@ probe_vars <- apply(expr_qc, 1, var)
 # Top 1000 most variable probes
 top1000 <- names(sort(probe_vars, decreasing = TRUE))[1:1000]
 expr_1000 <- expr_qc[top1000, ]
-
 ```
 
-
-```{r}
-
-```
-
-
-```{r}
 # Transpose + Scale
-X_500 <- t(expr_500)
+
+```{r}
 X_1000 <- t(expr_1000)
 
-dim(X_500)    # 395 x 500
 dim(X_1000)   # 395 x 1000
 
-X_500_scaled <- scale(X_500)
 X_1000_scaled <- scale(X_1000)
+```
+Now load metadata directly from EBI
 
-write.csv(X_500_scaled, "expression_500_scaled.csv")
-write.csv(X_1000_scaled, "expression_1000_scaled.csv")
+```{r}
+sdrf_url <- "https://www.ebi.ac.uk/biostudies/files/E-MTAB-1425/E-MTAB-1425.sdrf.txt"
+metadata <- read.delim(sdrf_url, stringsAsFactors = FALSE)
 
-# Save probe IDs for interpretation
-write.csv(colnames(X_500_scaled), "probes_500.csv")
-write.csv(colnames(X_1000_scaled), "probes_1000.csv")
+# Check the column names to find Sex and Disease
+# It is named "Characteristics.sex."
+head(metadata)
+```
+
+Clean Metadata, then merge with expression data
+
+```{r}
+# Fix the expression datarow names
+clean_expr_ids <- gsub("^X", "", rownames(X_1000_scaled))
+rownames(X_1000_scaled) <- clean_expr_ids
+
+# Check
+head(rownames(X_1000_scaled))
+
+# Clean Metadata IDs
+metadata$clean_id <- as.character(metadata$Source.Name)
+
+# Find common samples
+common_samples <- intersect(rownames(X_1000_scaled), metadata$clean_id)
+
+# Subset and align
+X_matched <- X_1000_scaled[common_samples, ]
+meta_matched <- metadata[match(common_samples, metadata$clean_id), ]
+
+# Check
+all(rownames(X_matched) == meta_matched$clean_id)
+
+# Create vectors for sex and disease status
+sex_vec <- factor(meta_matched$Characteristics.sex.)
+disease_vec <- factor(meta_matched$Characteristics.disease)
+age_vec <- as.numeric(meta_matched$Characteristics.age.)
+
+# Check 
+print(length(common_samples)) # It is exactly 395
+table(sex_vec)
+table(disease_vec)
+table(age_vec)
+```
+
+Filter sex or age-associated genes among the top 1000 expressed
+
+```{r}
+# Functions to get p-value (for sex and age association)
+get_sex_pval <- function(gene_col) {
+  # gene_col (1 gene per col) from X_matched
+  summary(lm(gene_col ~ sex_vec))$coefficients[2, 4] 
+}
+
+get_age_pval <- function(gene_col) {
+  # gene_col (1 gene per col) from X_matched
+  summary(lm(gene_col ~ age_vec))$coefficients[2, 4] 
+}
+
+# Run regressions
+sex_pvals <- apply(X_matched, 2, get_sex_pval)
+age_pvals <- apply(X_matched, 2, get_age_pval) 
+
+# Adjust for multiple resting
+sex_qvals <- p.adjust(sex_pvals, method = "BH")
+age_qvals <- p.adjust(age_pvals, method = "BH")
+
+# Filter by intersection
+# Wang et al. (2016) removes genes associated with EITHER age OR sex.
+keep_condition <- (sex_qvals > 0.01) & (age_qvals > 0.01)
+genes_to_keep <- colnames(X_matched)[keep_condition]
+
+# Subset
+X_filtered <- X_matched[, genes_to_keep]
+
 ```
 
