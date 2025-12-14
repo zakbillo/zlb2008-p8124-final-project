@@ -1,0 +1,115 @@
+---
+title: "p8124-final-project"
+author: Zakari Lowenthal Billo (zlb2008)
+output: pdf_document
+---
+
+```{r include=false}
+library(tidyverse)
+```
+## Pre-processing 
+
+This is expression data profiling by array of human lymphoblastoid cell lines derived from 400 children from families recruited through a proband with asthma
+
+```{r}
+# Rows: Affymetrix probe sets
+# Columns: samples (individuals)
+# One non-data row containing the string "RMA Normalized"
+
+expr_raw <- read.table(
+  "data/Normalized_expression.txt",
+  header = TRUE,
+  sep = "\t",
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+# Inspect 
+str(expr_raw)
+dim(expr_raw)
+```
+
+Set probe IDs as row names
+
+```{r}
+rownames(expr_raw) <- expr_raw[, 1]
+expr_raw <- expr_raw[, -1]
+
+# Check 
+head(rownames(expr_raw))
+```
+
+Remove non-expression descriptor row
+
+```{r}
+expr_raw <- expr_raw[-1, ]
+
+# Check 
+head(expr_raw[, 1])
+
+# Force to numeric
+expr <- as.data.frame(lapply(expr_raw, as.numeric))
+
+rownames(expr) <- rownames(expr_raw)
+```
+
+Final check for data validity
+
+```{r}
+# 54,675 probes x 395 samples
+dim(expr)
+
+# Missing values (should be 0 or very small)
+sum(is.na(expr))
+
+# Distribution check (RMA-normalized log2 values)
+summary(as.vector(as.matrix(expr)))
+```
+
+Remove low-expression probes (biological QC), then do variance-based filtering
+
+```{r}
+probe_means <- rowMeans(expr)
+
+# Remove bottom 40% of probes by mean expression (smilar to Wang et al.)
+mean_cutoff <- quantile(probe_means, 0.40) 
+expr_qc <- expr[probe_means > mean_cutoff, ]
+
+dim(expr_qc)  # Expect ~40,000 probes remaining
+
+probe_vars <- apply(expr_qc, 1, var)
+
+# Pre-specified gene set sizes for comparison
+# (satisfies "compare two approaches" requirement)
+
+# Top 1000 most variable probes
+top1000 <- names(sort(probe_vars, decreasing = TRUE))[1:1000]
+expr_1000 <- expr_qc[top1000, ]
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+# Transpose + Scale
+X_500 <- t(expr_500)
+X_1000 <- t(expr_1000)
+
+dim(X_500)    # 395 x 500
+dim(X_1000)   # 395 x 1000
+
+X_500_scaled <- scale(X_500)
+X_1000_scaled <- scale(X_1000)
+
+write.csv(X_500_scaled, "expression_500_scaled.csv")
+write.csv(X_1000_scaled, "expression_1000_scaled.csv")
+
+# Save probe IDs for interpretation
+write.csv(colnames(X_500_scaled), "probes_500.csv")
+write.csv(colnames(X_1000_scaled), "probes_1000.csv")
+```
+
