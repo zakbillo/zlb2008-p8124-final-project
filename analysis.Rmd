@@ -171,7 +171,12 @@ active_genes <- rownames(coefs_aic)[coefs_aic[,1] != 0]
 
 active_genes <- setdiff(active_genes, "(Intercept)") # Remove intercept
 
-# Final dataset
-X_final_HLAC <- X_filtered[, c(HLA_C, active_genes)] # 395 x 16
+# Final datasets
+X_asthma_HLAC <- X_asthma[, c(HLA_C, active_genes)] # 395 x 16
+X_normal_HLAC <- X_normal[, c(HLA_C, active_genes)] # 395 x 16
+
+write_csv(X_asthma_HLAC, "data/X_asthma_HLAC.csv")
+write_csv(X_normal_HLAC, "data/X_normal_HLAC.csv")
 ```
 
+Run FCI on the stratified datasets
