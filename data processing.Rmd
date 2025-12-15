@@ -7,6 +7,7 @@ output: pdf_document
 ```{r include=false}
 library(tidyverse)
 ```
+
 ## Pre-processing (follow the steps of Wang et al.)
 
 This is expression data profiling by array of human lymphoblastoid cell lines derived from 400 children from families recruited through a proband with asthma
@@ -75,14 +76,11 @@ probe_means <- rowMeans(expr)
 mean_cutoff <- quantile(probe_means, 0.40) 
 expr_qc <- expr[probe_means > mean_cutoff, ]
 
-dim(expr_qc)  # Expect ~40,000 probes remaining
+dim(expr_qc) # 32805 probes x 395 samples
 
 probe_vars <- apply(expr_qc, 1, var)
 
-# Pre-specified gene set sizes for comparison
-# (satisfies "compare two approaches" requirement)
-
-# Top 1000 most variable probes
+# Now take top 1000 most variable probes
 top1000 <- names(sort(probe_vars, decreasing = TRUE))[1:1000]
 expr_1000 <- expr_qc[top1000, ]
 ```
@@ -92,7 +90,7 @@ expr_1000 <- expr_qc[top1000, ]
 ```{r}
 X_1000 <- t(expr_1000)
 
-dim(X_1000)   # 395 x 1000
+dim(X_1000) # 395 x 1000
 
 X_1000_scaled <- scale(X_1000)
 ```
@@ -117,10 +115,10 @@ rownames(X_1000_scaled) <- clean_expr_ids
 # Check
 head(rownames(X_1000_scaled))
 
-# Clean Metadata IDs
+# Clean the Metadata IDs
 metadata$clean_id <- as.character(metadata$Source.Name)
 
-# Find common samples
+# Find the common samples
 common_samples <- intersect(rownames(X_1000_scaled), metadata$clean_id)
 
 # Subset and align
@@ -165,7 +163,7 @@ sex_qvals <- p.adjust(sex_pvals, method = "BH")
 age_qvals <- p.adjust(age_pvals, method = "BH")
 
 # Filter by intersection
-# Wang et al. (2016) removes genes associated with EITHER age OR sex.
+# Wang et al. (2016) removes genes associated with age or sex
 keep_condition <- (sex_qvals > 0.01) & (age_qvals > 0.01)
 genes_to_keep <- colnames(X_matched)[keep_condition]
 
@@ -173,17 +171,21 @@ genes_to_keep <- colnames(X_matched)[keep_condition]
 X_filtered <- X_matched[, genes_to_keep]
 ```
 
-Only keep the asthmatics
+Only separate the dataset into asthmatics and non-asthmatics
 
 ```{r}
-# Identify asthmatic samples
+# Identify subsamples
 asthma_idx <- which(disease_vec == "asthma")
+normal_idx <- which(disease_vec == "normal")
 
 # Subset the expression matrix
 X_asthma <- X_filtered[asthma_idx, ]
+X_normal <- X_filtered[normal_idx, ]
 
 # Check final dimensions
 dim(X_asthma)  # Exactly 258 samples x 934 probes
+dim(X_normal)  # Exactly 134 samples x 934 probes
 
-write_csv(as.data.frame(X_asthma), "X_asthma.csv")
+write_csv(as.data.frame(X_asthma), "data/X_asthma.csv")
+write_csv(as.data.frame(X_normal), "data/X_normal.csv")
 ```

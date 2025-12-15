@@ -10,17 +10,168 @@ library(glmnet)
 library(pcalg)
 library(foreach)
 library(doParallel)
+library(reshape2)
 source("lv-ida/lvida.R")
 source("lv-ida/iscyclic.R")
 ```
 
-## Load clean X_asthma dataset
+## Load clean datasets
 
 ```{r}
+X_filtered <- read_csv("data/X_filtered.csv")
+X_filtered <- as.data.frame(X_filtered)
+
 X_asthma <- read_csv("data/X_asthma.csv")
+X_asthma <- as.data.frame(X_asthma)
+
+X_normal <- read_csv("data/X_normal.csv")
+X_normal <- as.data.frame(X_normal)
 ```
 
-```{r}
+Identify childhood asthma onset gene HLA-C or `215175_at` (based on Clay et al. 2022)
 
+```{r}
+HLA_C <- "215175_at" 
+```
+
+Run Lasso for the HLA-C neighborhood and Compare lamda options for optimal selection
+
+```{r}
+y <- as.numeric(X_filtered[, HLA_C])
+x <- as.matrix(X_filtered[, setdiff(colnames(X_filtered), HLA_C)])
+
+# Define lambda sequence 
+full_fit <- glmnet(x, y, alpha = 1)
+lambda_seq <- full_fit$lambda
+
+# Calculate criteria (BIC, EBIC, AIC)
+n <- nrow(x)
+p <- ncol(x)
+
+# Extract stats
+deviance <- (1 - full_fit$dev.ratio) * full_fit$nulldev
+df <- full_fit$df
+
+# Calculate 
+# AIC = Deviance + 2*df
+aic <- deviance + 2 * df
+
+# BIC = Deviance + log(n)*df
+bic <- deviance + log(n) * df
+
+# EBIC = BIC + 2*gamma*log(Choose(p, df)) with Gamma = 0.5 being standard for p >> n
+gamma <- 0.5
+ebic <- bic + 2 * gamma * lchoose(p, df)
+
+# Find optimal lambdas
+opt_lambda_aic  <- lambda_seq[which.min(aic)]
+opt_lambda_bic  <- lambda_seq[which.min(bic)]
+opt_lambda_ebic <- lambda_seq[which.min(ebic)]
+```
+
+Stability selection for n/2 at 1000 bootstraps
+
+```{r}
+# Lambda stability selection (1000 bootstraps)
+n_stab_boot <- 1000
+n_cores <- detectCores() - 1
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+# Function run lasso and return binary inclusion matrix
+run_lasso_sub <- function(x, y, lambdas) {
+  # Subsample n/2
+  sub_idx <- sample(1:nrow(x), floor(nrow(x)/2), replace = FALSE)
+  fit <- glmnet(x[sub_idx,], y[sub_idx], alpha = 1, lambda = lambdas)
+  
+  # Return matrix: 1 if coef != 0, else 0
+  return(as.matrix(coef(fit)[-1, ] != 0) * 1) 
+}
+
+# Export data
+clusterExport(cl, c("x", "y", "lambda_seq", "run_lasso_sub"))
+clusterEvalQ(cl, library(glmnet))
+
+# Run in parallel
+stab_list <- foreach(i = 1:n_stab_boot) %dopar% {
+  run_lasso_sub(x, y, lambda_seq)
+}
+stopCluster(cl)
+
+# Compute selection probability at each Lambda
+prob_matrix <- Reduce("+", stab_list) / n_stab_boot
+colnames(prob_matrix) <- round(log(lambda_seq), 2)
+```
+
+Visualization for Lasso approach
+
+```{r}
+# Make a df for plotting criteria
+criteria_df <- data.frame(
+  LogLambda = log(lambda_seq),
+  AIC = scale(aic), 
+  BIC = scale(bic),
+  EBIC = scale(ebic)
+)
+criteria_long <- melt(criteria_df, id.vars = "LogLambda")
+
+# Plot 
+p1 <- ggplot(criteria_long, aes(x = LogLambda, y = value, color = variable)) +
+  geom_line(size = 1) +
+  
+  # EBIC Line & Label
+  geom_vline(xintercept = log(opt_lambda_ebic), linetype="dashed", color="darkgreen") +
+  annotate("text", x=log(opt_lambda_ebic), y=max(criteria_long$value), 
+           label="Optimal EBIC", hjust=-0.1, color="darkgreen") +
+  
+  # BIC Line & Label
+  geom_vline(xintercept = log(opt_lambda_bic), linetype="dashed", color="orange") +
+  annotate("text", x=log(opt_lambda_bic), y=max(criteria_long$value), 
+           label="Optimal BIC", hjust=1.1, color="orange") +
+  
+  # AIC Line & Label
+  geom_vline(xintercept = log(opt_lambda_aic), linetype="dashed", color="purple") +
+  annotate("text", x=log(opt_lambda_aic), y=max(criteria_long$value), 
+           label="Optimal AIC", hjust=1.1, color="purple") +
+  
+  labs(title = "Model Selection Criteria (Scaled)", y = "Standardized Score") +
+  theme_minimal()
+
+print(p1)
+```
+
+Gene count at each optimal log Lambda 
+
+```{r}
+opt_lambda_aic  <- exp(criteria_df$LogLambda[which.min(criteria_df$AIC)])
+opt_lambda_bic  <- exp(criteria_df$LogLambda[which.min(criteria_df$BIC)])
+opt_lambda_ebic <- exp(criteria_df$LogLambda[which.min(criteria_df$EBIC)])
+
+# Helper function
+get_gene_count <- function(fit, lambda_val) {
+  coefs <- coef(fit, s = lambda_val)
+  n_genes <- sum(as.matrix(coefs) != 0) - 1
+  return(n_genes)
+}
+
+# Counts
+count_aic  <- get_gene_count(full_fit, opt_lambda_aic) #15
+count_bic  <- get_gene_count(full_fit, opt_lambda_bic) #3, way too sparse
+count_ebic <- get_gene_count(full_fit, opt_lambda_ebic) #2, way too sparse
+```
+
+Ultimately going with AIC (15 genes) due to other methods being far too sparse at 1000 bootstraps
+
+```{r}
+opt_lambda_aic <- lambda_seq[which.min(aic)]
+
+coefs_aic <- coef(full_fit, s = opt_lambda_aic)
+
+active_genes <- rownames(coefs_aic)[coefs_aic[,1] != 0]
+
+active_genes <- setdiff(active_genes, "(Intercept)") # Remove intercept
+
+# Final dataset
+X_final_HLAC <- X_filtered[, c(HLA_C, active_genes)] # 395 x 16
 ```
 
