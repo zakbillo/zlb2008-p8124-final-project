@@ -1,0 +1,24 @@
+---
+title: "analysis"
+author: "Zakari L. Billo"
+output: pdf_document
+---
+
+```{r include=false}
+library(tidyverse)
+library(glmnet)
+library(pcalg)
+source("lv-ida/lvida.R")
+source("lv-ida/iscyclic.R")
+```
+
+## Load clean X_asthma dataset
+
+```{r}
+X_asthma <- read_csv("data/X_asthma.csv")
+```
+
+```{r}
+
+```
+

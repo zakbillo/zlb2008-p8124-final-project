@@ -1,5 +1,5 @@
 ---
-title: "p8124-final-project"
+title: "data processing"
 author: Zakari Lowenthal Billo (zlb2008)
 output: pdf_document
 ---
@@ -142,7 +142,7 @@ table(disease_vec)
 table(age_vec)
 ```
 
-Filter sex or age-associated genes among the top 1000 expressed
+Filter out sex or age-associated genes among the top 1000 expressed
 
 ```{r}
 # Functions to get p-value (for sex and age association)
@@ -171,6 +171,19 @@ genes_to_keep <- colnames(X_matched)[keep_condition]
 
 # Subset
 X_filtered <- X_matched[, genes_to_keep]
-
 ```
 
+Only keep the asthmatics
+
+```{r}
+# Identify asthmatic samples
+asthma_idx <- which(disease_vec == "asthma")
+
+# Subset the expression matrix
+X_asthma <- X_filtered[asthma_idx, ]
+
+# Check final dimensions
+dim(X_asthma)  # Exactly 258 samples x 934 probes
+
+write_csv(as.data.frame(X_asthma), "X_asthma.csv")
+```
