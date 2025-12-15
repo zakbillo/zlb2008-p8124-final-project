@@ -8,6 +8,8 @@ output: pdf_document
 library(tidyverse)
 library(glmnet)
 library(pcalg)
+library(foreach)
+library(doParallel)
 source("lv-ida/lvida.R")
 source("lv-ida/iscyclic.R")
 ```
