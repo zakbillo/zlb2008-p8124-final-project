@@ -11,8 +11,6 @@ library(pcalg)
 library(foreach)
 library(doParallel)
 library(reshape2)
-source("lv-ida/lvida.R")
-source("lv-ida/iscyclic.R")
 ```
 
 ## Load clean datasets
@@ -49,17 +47,17 @@ n <- nrow(x)
 p <- ncol(x)
 
 # Extract stats
-deviance <- (1 - full_fit$dev.ratio) * full_fit$nulldev
+# For gaussian family, 'deviance' returned by glmnet is the RSS (Residual Sum of Squares)
+RSS <- (1 - full_fit$dev.ratio) * full_fit$nulldev
 df <- full_fit$df
 
-# Calculate 
-# AIC = Deviance + 2*df
-aic <- deviance + 2 * df
+# Calculate Criteria using Log-Likelihood approximation
+# (Adding the constant 'n' or 'n*log(2*pi)' doesn't change the minimum, so we omit it)
+aic <- n * log(RSS / n) + 2 * df
+bic <- n * log(RSS / n) + log(n) * df
 
-# BIC = Deviance + log(n)*df
-bic <- deviance + log(n) * df
-
-# EBIC = BIC + 2*gamma*log(Choose(p, df)) with Gamma = 0.5 being standard for p >> n
+# EBIC
+# Gamma = 0.5 is standard for cases where p >> n (high-dimensional data)
 gamma <- 0.5
 ebic <- bic + 2 * gamma * lchoose(p, df)
 
@@ -69,7 +67,7 @@ opt_lambda_bic  <- lambda_seq[which.min(bic)]
 opt_lambda_ebic <- lambda_seq[which.min(ebic)]
 ```
 
-Stability selection for n/2 at 1000 bootstraps
+Stability selection at 1000 bootstraps
 
 ```{r}
 # Lambda stability selection (1000 bootstraps)
@@ -80,8 +78,7 @@ registerDoParallel(cl)
 
 # Function run lasso and return binary inclusion matrix
 run_lasso_sub <- function(x, y, lambdas) {
-  # Subsample n/2
-  sub_idx <- sample(1:nrow(x), floor(nrow(x)/2), replace = FALSE)
+  sub_idx <- sample(1:nrow(x), floor(nrow(x)), replace = FALSE)
   fit <- glmnet(x[sub_idx,], y[sub_idx], alpha = 1, lambda = lambdas)
   
   # Return matrix: 1 if coef != 0, else 0
@@ -132,7 +129,7 @@ p1 <- ggplot(criteria_long, aes(x = LogLambda, y = value, color = variable)) +
   # AIC Line & Label
   geom_vline(xintercept = log(opt_lambda_aic), linetype="dashed", color="purple") +
   annotate("text", x=log(opt_lambda_aic), y=max(criteria_long$value), 
-           label="Optimal AIC", hjust=1.1, color="purple") +
+           label="Optimal AIC", hjust=-0.1, color="purple") +
   
   labs(title = "Model Selection Criteria (Scaled)", y = "Standardized Score") +
   theme_minimal()
@@ -140,7 +137,7 @@ p1 <- ggplot(criteria_long, aes(x = LogLambda, y = value, color = variable)) +
 print(p1)
 ```
 
-Gene count at each optimal log Lambda 
+Gene count at each optimal log Lambda (AIC, BIC or EBIC)
 
 ```{r}
 opt_lambda_aic  <- exp(criteria_df$LogLambda[which.min(criteria_df$AIC)])
@@ -155,28 +152,274 @@ get_gene_count <- function(fit, lambda_val) {
 }
 
 # Counts
-count_aic  <- get_gene_count(full_fit, opt_lambda_aic) #15
-count_bic  <- get_gene_count(full_fit, opt_lambda_bic) #3, way too sparse
-count_ebic <- get_gene_count(full_fit, opt_lambda_ebic) #2, way too sparse
+count_aic  <- get_gene_count(full_fit, opt_lambda_aic) #281
+count_bic  <- get_gene_count(full_fit, opt_lambda_bic) #4, way too sparse
+count_ebic <- get_gene_count(full_fit, opt_lambda_ebic) #3, way too sparse
 ```
 
-Ultimately going with AIC (15 genes) due to other methods being far too sparse at 1000 bootstraps
+Going with a consensus heuristic due to approaches being either too sparse or large at 1000 bootstraps
 
 ```{r}
-opt_lambda_aic <- lambda_seq[which.min(aic)]
+# 1. Standardize the metrics (matching your plot)
+scale_vec <- function(x) as.vector(scale(x))
+scaled_aic <- scale_vec(aic)
+scaled_bic <- scale_vec(bic)
 
-coefs_aic <- coef(full_fit, s = opt_lambda_aic)
+# 2. Find the index where the difference between AIC and BIC is smallest
+# This is the mathematical "intersection" of the lines in your plot
+diff_metric <- abs(scaled_aic - scaled_bic)
+intersection_idx <- which.min(diff_metric)
 
-active_genes <- rownames(coefs_aic)[coefs_aic[,1] != 0]
+# 3. Get the Lambda and Gene Count at this intersection
+opt_lambda_intersect <- lambda_seq[intersection_idx]
+count_intersect <- get_gene_count(full_fit, opt_lambda_intersect)
 
-active_genes <- setdiff(active_genes, "(Intercept)") # Remove intercept
+# 4. Print the result
+cat("--- Consensus Heuristic ---\n")
+cat("Intersection Log(Lambda):", log(opt_lambda_intersect), "\n")
+cat("Gene Count at Intersection:", count_intersect, "\n")
 
-# Final datasets
-X_asthma_HLAC <- X_asthma[, c(HLA_C, active_genes)] # 395 x 16
-X_normal_HLAC <- X_normal[, c(HLA_C, active_genes)] # 395 x 16
-
-write_csv(X_asthma_HLAC, "data/X_asthma_HLAC.csv")
-write_csv(X_normal_HLAC, "data/X_normal_HLAC.csv")
+# Recommendation Logic
+if(count_intersect >= 10 & count_intersect <= 80) {
+  cat("VERDICT: Perfect. Use this lambda for FCI.\n")
+} else {
+  cat("VERDICT: Still off. Consider manually forcing top 30-50 genes.\n")
+}
 ```
 
-Run FCI on the stratified datasets
+Choose top 25 from consensus heuristic for a more computationally feasible dataset
+
+```{r}
+# 1. Get coefficients from the intersection model
+# (Using the 'opt_lambda_intersect' you calculated earlier)
+coefs_final <- coef(full_fit, s = opt_lambda_intersect)
+
+# 2. Convert to data frame for sorting
+coefs_df <- data.frame(
+  Gene = rownames(coefs_final),
+  Coefficient = as.numeric(coefs_final)
+)
+
+# 3. Remove Intercept and Zero-coefficient genes
+coefs_df <- coefs_df[coefs_df$Gene != "(Intercept)" & coefs_df$Coefficient != 0, ]
+
+# 4. Sort by Absolute Strength (Magnitude)
+# This prioritizes the strongest signals regardless of direction (+/-)
+coefs_df$Abs_Coef <- abs(coefs_df$Coefficient)
+coefs_df <- coefs_df[order(-coefs_df$Abs_Coef), ]
+
+# --- DECISION POINT: TOP 25 ---
+top_n <- 25
+top_genes <- head(coefs_df$Gene, top_n)
+
+# 5. Create the "Safe" Datasets
+# CRITICAL STEP: Combine HLA_C (Target) with the Top Genes
+vars_to_keep_safe <- c(HLA_C, top_genes)
+
+# Subset the asthma and normal datasets
+X_asthma_top25 <- X_asthma[, vars_to_keep_safe]
+X_normal_top25 <- X_normal[, vars_to_keep_safe]
+
+# 6. Save
+write.csv(X_asthma_top25, "data/X_asthma_top25.csv", row.names = FALSE)
+write.csv(X_normal_top25, "data/X_normal_top25.csv", row.names = FALSE)
+```
+
+```{r}
+pag_plot <- function(data, title = NULL, file_name = NULL) {
+  
+  # Title setup
+  data_arg_name <- deparse(substitute(data)) 
+  if (is.null(title)) {
+    clean_name <- if(data_arg_name == ".") "Data" else data_arg_name
+    title <- paste("Estimated PAG:", clean_name)
+  }
+  
+  alphas <- c(0.01, 0.05, 0.10)
+  
+  # Store results in a df
+  edge_counts <- data.frame(Alpha = numeric(), Edge_Count = integer())
+
+  # Filename setup
+  if (is.null(file_name)) {
+    clean_title <- gsub("[^[:alnum:]]", "_", title)
+    file_name <- paste0(clean_title, ".pdf")
+  }
+
+  suffStat <- list(C = cor(data), n = nrow(data))
+  
+  pdf(file_name, width = 10, height = 10)
+  
+  for (alpha in alphas) {
+    
+    # Run FCI
+    pag.est <- fci(suffStat, indepTest = gaussCItest, alpha = alpha, labels = colnames(data))
+    
+    # Extract amat
+    amat <- pag.est@amat
+    
+    # Count non-zero entries in the upper triangle
+    current_edges <- sum(amat[upper.tri(amat)] != 0)
+    
+    # Append to results
+    edge_counts <- rbind(edge_counts, data.frame(Alpha = alpha, Edge_Count = current_edges))
+    
+    # Plot
+    page_title <- paste0(title, " (alpha = ", alpha, " | Edges = ", current_edges, ")")
+    plot(pag.est, main = page_title)
+  }
+  
+  dev.off()
+  
+  # Return the table of counts
+  return(edge_counts)
+}
+
+counts_asthma <- pag_plot(X_asthma_top25)
+print(counts_asthma) # 15 at 0.01, 17 at 0.05, 21 at 0.10
+```
+
+Use LV-IDA to see the causal effect of HLA-C on other genes
+
+```{r}
+library(pcalg)
+
+# Ensure your function is loaded
+source("lv-ida/lvida.R") 
+source("lv-ida/iscyclic.R")
+
+estimate_downstream_effects <- function(data, cause_var, n_boots = 500, title = NULL, file_name = NULL) {
+  
+  # Setup
+  alphas <- c(0.01, 0.05, 0.10)
+  cause_idx <- which(colnames(data) == cause_var)
+  
+  if (length(cause_idx) == 0) stop("Cause variable not found in data.")
+  
+  # "Predictors" here are actually potential TARGETS (Effects)
+  potential_targets <- colnames(data)[-cause_idx]
+  n_targets <- length(potential_targets)
+  n_obs <- nrow(data)
+  
+  final_summary <- data.frame()
+  
+  # Title/File setup
+  if (is.null(title)) title <- paste("Downstream Analysis | Cause:", cause_var)
+  if (is.null(file_name)) {
+    clean_cause <- gsub("[^[:alnum:]]", "_", cause_var)
+    file_name <- paste0("Downstream_Effects_", clean_cause, ".pdf")
+    csv_name <- paste0("Downstream_Effects_", clean_cause, ".csv")
+  } else {
+    # derive csv name from pdf name
+    csv_name <- sub(".pdf$", ".csv", file_name)
+  }
+  
+  pdf(file_name, width = 12, height = 10)
+  
+  for (alpha in alphas) {
+    message(paste("\n=== Processing Alpha =", alpha, "==="))
+    
+    # Rows = Targets, Cols = Bootstrap Iterations
+    boot_min_effects <- matrix(NA, nrow = n_targets, ncol = n_boots)
+    boot_max_effects <- matrix(NA, nrow = n_targets, ncol = n_boots)
+    
+    # --- BOOTSTRAP LOOP ---
+    for (b in 1:n_boots) {
+      if (b %% 50 == 0) message(paste("  Bootstrap", b, "/", n_boots))
+      
+      # Resample
+      boot_indices <- sample(1:n_obs, n_obs, replace = TRUE)
+      boot_data <- data[boot_indices, ]
+      
+      # Re-calculate stats
+      suffStat <- list(C = cor(boot_data, use = "complete.obs"), n = n_obs)
+      mcov <- cov(boot_data, use = "complete.obs")
+      
+      # Run FCI
+      pag.est <- tryCatch({
+        fci(suffStat, indepTest = gaussCItest, alpha = alpha, labels = colnames(data), verbose = FALSE)
+      }, error = function(e) return(NULL))
+      
+      if (is.null(pag.est)) next
+      
+      amat <- pag.est@amat
+      
+      # Loop through potential DOWNSTREAM targets
+      for (i in seq_along(potential_targets)) {
+        target_name <- potential_targets[i]
+        target_idx <- which(colnames(data) == target_name)
+        
+        # --- LOGIC FLIP: Check if Cause -> Target is possible ---
+        # We check if 'target_idx' is in the descendants of 'cause_idx'
+        is_possible_descendant <- target_idx %in% pcalg::possibleDe(amat, cause_idx)
+        
+        if (!is_possible_descendant) {
+          boot_min_effects[i, b] <- 0
+          boot_max_effects[i, b] <- 0
+        } else {
+          
+          # --- DYNAMIC FUNCTION CALL ---
+          tryCatch({
+            if (exists("lvida", mode = "function")) {
+               # args: x (cause), y (effect), cov, graph
+               effs <- lvida(cause_idx, target_idx, mcov, amat)
+            } else {
+               effs <- lvIda(cause_idx, target_idx, mcov, amat)
+            }
+            
+            if (!all(is.na(effs))) {
+              boot_min_effects[i, b] <- min(abs(effs))
+              boot_max_effects[i, b] <- max(abs(effs))
+            } else {
+              boot_min_effects[i, b] <- 0
+              boot_max_effects[i, b] <- 0
+            }
+          }, error = function(e) {
+             boot_min_effects[i, b] <- NA
+             boot_max_effects[i, b] <- NA
+          })
+        }
+      }
+    } 
+    
+    # Summarize Results for this alpha
+    alpha_summary <- data.frame(
+      Target_Gene = potential_targets,
+      Alpha = alpha,
+      Stability_Pct = rowMeans(boot_max_effects > 0, na.rm = TRUE) * 100,
+      Median_Min_Effect = apply(boot_min_effects, 1, function(x) median(x[x > 0], na.rm = TRUE)),
+      Median_Max_Effect = apply(boot_max_effects, 1, function(x) median(x[x > 0], na.rm = TRUE))
+    )
+    
+    alpha_summary[is.na(alpha_summary)] <- 0
+    final_summary <- rbind(final_summary, alpha_summary)
+    
+    # Reference Plot
+    suffStat_full <- list(C = cor(data), n = nrow(data))
+    pag_full <- fci(suffStat_full, indepTest = gaussCItest, alpha = alpha, labels = colnames(data))
+    
+    # Label top downstream targets
+    top_targets <- alpha_summary[order(-alpha_summary$Stability_Pct), ][1:3, ]
+    caption <- paste("Top Downstream Targets:", paste(top_targets$Target_Gene, "(", round(top_targets$Stability_Pct,0), "%)", collapse=", "))
+    
+    plot(pag_full, main = paste0(title, "\nalpha=", alpha, "\n", caption))
+    
+  } 
+  
+  dev.off()
+  
+  # --- NEW: Save to CSV ---
+  write.csv(final_summary, csv_name, row.names = FALSE)
+  message(paste("Saved edge list to:", csv_name))
+  
+  return(final_summary)
+}
+
+# --- Run ---
+# Note: 'target_var' here is actually the CAUSE variable
+results_asthma <- estimate_downstream_effects(X_asthma_HLAC, cause_var = "215175_at", n_boots = 500)
+results_normal <- estimate_downstream_effects(X_normal_HLAC, cause_var = "215175_at", n_boots = 500)
+
+
+```
+

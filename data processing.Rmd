@@ -6,6 +6,10 @@ output: pdf_document
 
 ```{r include=false}
 library(tidyverse)
+library(BiocManager)
+library(AnnotationDbi)
+library(hgu133plus2.db)
+library(matrixStats)
 ```
 
 ## Pre-processing (follow the steps of Wang et al.)
@@ -112,9 +116,6 @@ Clean Metadata, then merge with expression data
 clean_expr_ids <- gsub("^X", "", rownames(X_1000_scaled))
 rownames(X_1000_scaled) <- clean_expr_ids
 
-# Check
-head(rownames(X_1000_scaled))
-
 # Clean the Metadata IDs
 metadata$clean_id <- as.character(metadata$Source.Name)
 
@@ -132,12 +133,6 @@ all(rownames(X_matched) == meta_matched$clean_id)
 sex_vec <- factor(meta_matched$Characteristics.sex.)
 disease_vec <- factor(meta_matched$Characteristics.disease)
 age_vec <- as.numeric(meta_matched$Characteristics.age.)
-
-# Check 
-print(length(common_samples)) # It is exactly 395
-table(sex_vec)
-table(disease_vec)
-table(age_vec)
 ```
 
 Filter out sex or age-associated genes among the top 1000 expressed
@@ -166,25 +161,74 @@ age_qvals <- p.adjust(age_pvals, method = "BH")
 # Wang et al. (2016) removes genes associated with age or sex
 keep_condition <- (sex_qvals > 0.01) & (age_qvals > 0.01)
 genes_to_keep <- colnames(X_matched)[keep_condition]
-
-# Subset
-X_filtered <- X_matched[, genes_to_keep]
 ```
 
-Only separate the dataset into asthmatics and non-asthmatics
+For microarray preprocessing, convert probe IDs to gene symbols, choose the highest variance probe for each gene assignment and avoid B cell confounding genes (IGH, IGK, and IGL). I only want protein encoding genes.
+
+```{r}
+# map probes to symbols
+probe_annotation <- AnnotationDbi::select(
+  hgu133plus2.db,
+  keys     = genes_to_keep,
+  keytype  = "PROBEID",
+  columns  = c("SYMBOL", "ENTREZID", "GENENAME")
+)
+
+# filter for protein coding only
+# careful: "P$" removes pseudogenes but might hit valid genes ending in P (check your annotation style)
+probe_annotation_clean <- probe_annotation %>%
+  filter(!is.na(SYMBOL)) %>%
+  filter(!grepl("^LOC|^LINC|P$", SYMBOL)) %>% # drop predicted, lncRNA, pseudogenes
+  filter(!grepl("^IG[HKL]", SYMBOL)) %>%      # drop immunoglobulins associated with B-cells
+  distinct(PROBEID, SYMBOL, .keep_all = TRUE) %>%
+  filter(PROBEID %in% colnames(X_matched))
+
+probe_ids <- probe_annotation_clean$PROBEID
+
+# calc probe variance
+probe_variance <- apply(
+  X_matched[, probe_ids, drop = FALSE],
+  2,
+  var
+)
+
+# pick top probe per gene
+top_variance_probes <- probe_annotation_clean %>%
+  mutate(var = probe_variance[PROBEID]) %>%
+  group_by(SYMBOL) %>%
+  slice_max(var, n = 1, with_ties = FALSE) %>% # force unique row per gene
+  ungroup()
+
+write_csv(top_variance_probes, "data/top_probe_to_gene_mapping.csv")
+
+# subset expression matrix
+valid_probes <- top_variance_probes$PROBEID
+X_filtered <- X_matched[, valid_probes, drop = FALSE] 
+
+# rename cols to symbols
+probe_to_gene <- setNames(
+  top_variance_probes$SYMBOL,
+  top_variance_probes$PROBEID
+)
+
+colnames(X_filtered) <- probe_to_gene[colnames(X_filtered)]
+colnames(X_filtered) <- make.unique(colnames(X_filtered)) # 642 x 395
+
+write_csv(as.data.frame(X_filtered), "data/X_filtered.csv")
+
+write_csv(data.frame(GENE = colnames(X_filtered)), "data/final_gene_list.csv")
+```
+
+Separate the filtered dataset into asthmatics and non-asthmatics
 
 ```{r}
 # Identify subsamples
 asthma_idx <- which(disease_vec == "asthma")
 normal_idx <- which(disease_vec == "normal")
 
-# Subset the expression matrix
+# Subset
 X_asthma <- X_filtered[asthma_idx, ]
 X_normal <- X_filtered[normal_idx, ]
-
-# Check final dimensions
-dim(X_asthma)  # Exactly 258 samples x 934 probes
-dim(X_normal)  # Exactly 134 samples x 934 probes
 
 write_csv(as.data.frame(X_asthma), "data/X_asthma.csv")
 write_csv(as.data.frame(X_normal), "data/X_normal.csv")
