@@ -37,7 +37,6 @@ x <- as.matrix(X_filtered[, setdiff(colnames(X_filtered), "HLA-DQB1")])
 # Test alphas from 0.1 to 1.0. 
 alpha_seq <- seq(0.1, 1, by = 0.1)
 cv_results <- lapply(alpha_seq, function(a) {
-  # nfolds=5 or 10 depending on sample size
   cv.glmnet(x, y, alpha = a, nfolds = 10) 
 })
 
@@ -73,37 +72,6 @@ opt_lambda_bic  <- lambda_seq[which.min(bic)]
 opt_lambda_ebic <- lambda_seq[which.min(ebic)]
 ```
 
-Stability selection at 1000, n/2 bootstraps for FDR control as described by Meinshausen & Bühlmann, 2010
-
-```{r}
-n_stab_boot <- 1000
-n_cores <- detectCores() - 1
-cl <- makeCluster(n_cores)
-registerDoParallel(cl)
-
-# Lasso
-run_lasso_sub <- function(x, y, lambdas, alpha_val) {
-  sub_idx <- sample(1:nrow(x), floor(nrow(x))/2, replace = FALSE)
-  fit <- glmnet(x[sub_idx,], y[sub_idx], alpha = alpha_val, lambda = lambdas)
-  coefs <- coef(fit, s = lambdas)
-  return(as.matrix(coefs[-1, ] != 0) * 1) 
-}
-
-# Export to cluster
-clusterExport(cl, c("x", "y", "lambda_seq", "run_lasso_sub", "best_alpha"))
-clusterEvalQ(cl, library(glmnet))
-
-# Parallelize
-stab_list <- foreach(i = 1:n_stab_boot) %dopar% {
-  run_lasso_sub(x, y, lambda_seq, best_alpha)
-}
-stopCluster(cl)
-
-# Compute probability
-prob_matrix <- Reduce("+", stab_list) / n_stab_boot
-colnames(prob_matrix) <- paste0("L", 1:length(lambda_seq)) 
-```
-
 Visualization for Lasso approach
 
 ```{r}
@@ -113,15 +81,18 @@ criteria_df <- data.frame(
   BIC = scale(bic),
   EBIC = scale(ebic)
 )
+
 criteria_long <- melt(criteria_df, id.vars = "LogLambda")
 
 p1 <- ggplot(criteria_long, aes(x = LogLambda, y = value, color = variable)) +
   geom_line(size = 1) +
   geom_vline(xintercept = log(opt_lambda_ebic), linetype="dashed", color="darkgreen") +
   annotate("text", x=log(opt_lambda_ebic), y=max(criteria_long$value), 
+
            label="EBIC", hjust=-0.1, color="darkgreen") +
   geom_vline(xintercept = log(opt_lambda_bic), linetype="dashed", color="orange") +
   annotate("text", x=log(opt_lambda_bic), y=max(criteria_long$value), 
+
            label="BIC", hjust=1.1, color="orange") +
   geom_vline(xintercept = log(opt_lambda_aic), linetype="dashed", color="purple") +
   annotate("text", x=log(opt_lambda_aic), y=max(criteria_long$value), 
@@ -145,35 +116,69 @@ cat("Genes at BIC:", get_gene_count(full_fit, opt_lambda_bic), "\n")
 cat("Genes at EBIC:", get_gene_count(full_fit, opt_lambda_ebic), "\n")
 ```
 
-Going with BIC due to other approaches being either too sparse or large at 1000 bootstraps
+Going with BIC, but increasing the BIC threshold to 24 (25 genes including target) using stability selection at the optimal BIC lambda and 1000, n/2 bootstraps for FDR control as described by Meinshausen & Bühlmann, 2010. This is because other approaches are either too sparse (EBIC) or large (AIC)
 
 ```{r}
-coefs_final <- coef(full_fit, s = opt_lambda_bic)
+n_stab_boot <- 10000
+n_cores <- detectCores() - 1
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
 
-# Convert to df
-coefs_df <- data.frame(
-  Gene = rownames(coefs_final),
-  Coefficient = as.numeric(coefs_final)
+# Subsampling function
+run_lasso_sub <- function(x, y, lambdas, alpha_val) {
+  sub_idx <- sample(1:nrow(x), floor(nrow(x))/2, replace = FALSE)
+  fit <- glmnet(x[sub_idx,], y[sub_idx], alpha = alpha_val, lambda = lambdas)
+  coefs <- coef(fit, s = lambdas)
+  return(as.matrix(coefs[-1, ] != 0) * 1) 
+}
+
+# Export Data + functions to cluster
+clusterExport(cl, c("x", "y", "lambda_seq", "run_lasso_sub", "best_alpha"))
+clusterEvalQ(cl, library(glmnet))
+
+# Bootstrap
+message(paste("Running", n_stab_boot, "stability bootstraps..."))
+stab_list <- foreach(i = 1:n_stab_boot) %dopar% {
+  run_lasso_sub(x, y, lambda_seq, best_alpha)
+}
+stopCluster(cl)
+
+# Stability probabilities
+prob_matrix <- Reduce("+", stab_list) / n_stab_boot
+colnames(prob_matrix) <- paste0("L", 1:length(lambda_seq))
+
+# Column index at optimal BIC Lambda
+target_lambda_idx <- which.min(abs(lambda_seq - opt_lambda_bic))
+
+# Stability scores at that Lambda
+gene_stability_scores <- prob_matrix[, target_lambda_idx]
+
+# Create and sort df
+stability_df <- data.frame(
+  Gene = names(gene_stability_scores),
+  Stability_Prob = as.numeric(gene_stability_scores)
 )
 
-# Remove intercept and zero-coefficient genes
-coefs_df <- coefs_df[coefs_df$Gene != "(Intercept)" & coefs_df$Coefficient != 0, ]
+# Sort descending
+stability_df <- stability_df[order(-stability_df$Stability_Prob), ]
 
-# Sort by absolute strength 
-coefs_df$Abs_Coef <- abs(coefs_df$Coefficient)
-coefs_df <- coefs_df[order(-coefs_df$Abs_Coef), ]
-selected_genes <- coefs_df$Gene
+# Top 25 genes
+top_genes <- head(stability_df$Gene, 25)
 
-# Create final data
-vars_to_keep_safe <- c("HLA-DQB1", selected_genes)
+# Include HLA-DQB1
+final_genes <- unique(c("HLA-DQB1", top_genes))
 
-# Subset the asthma and normal datasets
-X_asthma_top <- X_asthma[, vars_to_keep_safe]
-X_normal_top <- X_normal[, vars_to_keep_safe]
+# Remove the weakest gene after adding HLA-DQB1 back in
+if(length(final_genes) > 25) {
+  final_genes <- final_genes[1:25]
+}
 
-# Save
-write.csv(X_asthma_top, "data/X_asthma_top.csv", row.names = FALSE)
-write.csv(X_normal_top, "data/X_normal_top.csv", row.names = FALSE)
+# Save 
+X_asthma_stable <- X_asthma[, final_genes]
+write.csv(X_asthma_stable, "data/X_asthma_stable_25.csv", row.names = FALSE)
+
+X_normal_stable <- X_normal[, final_genes]
+write.csv(X_normal_stable, "data/X_normal_stable_25.csv", row.names = FALSE)
 ```
 
 Plot PAGs 
@@ -181,12 +186,8 @@ Plot PAGs
 ```{r}
 analyze_pag_sensitivity <- function(data, title = NULL, file_name = NULL) {
   
-  # Title and filename setup
+  # Filename setup
   data_arg_name <- deparse(substitute(data)) 
-  if (is.null(title)) {
-    clean_name <- if(data_arg_name == ".") "Data" else data_arg_name
-    title <- paste("Estimated PAG:", clean_name)
-  }
   
   if (is.null(file_name)) {
     clean_title <- gsub("[^[:alnum:]]", "_", title)
@@ -235,9 +236,9 @@ analyze_pag_sensitivity <- function(data, title = NULL, file_name = NULL) {
     
     # Title
     title_text <- paste0(title, 
-                         "\nALPHA: ", alpha, 
-                         "   |   Edges: ", current_edges, 
-                         "   |   Time: ", round(duration, 3), "s")
+                         "\nalpha: ", alpha, 
+                         "   edges: ", current_edges, 
+                         "   time: ", round(duration, 3), "s")
     
     title(main = title_text, col.main = "blue", cex.main = 1.5)
   }
@@ -247,14 +248,22 @@ analyze_pag_sensitivity <- function(data, title = NULL, file_name = NULL) {
   return(results_df)
 }
 
-results_asthma <- analyze_pag_sensitivity(X_asthma_top, 
-                                          title = "Asthma PAG Analysis", 
+results_asthma <- analyze_pag_sensitivity(X_asthma_top,
                                           file_name = "Asthma_PAG_Analysis.pdf")
 
-print(results_asthma)
+results_normal <- analyze_pag_sensitivity(X_normal_top,
+                                          file_name = "Normal_PAG_Analysis.pdf")
 
-# Visualization of the runtime
+print(results_asthma)
+print(results_normal)
+
+# Visualize runtime
 plot(results_asthma$Alpha, results_asthma$Time_Sec, 
+     type = "b", pch = 19, col = "red",
+     main = "Computation Time by Alpha",
+     xlab = "Alpha", ylab = "Time (seconds)")
+
+plot(results_normal$Alpha, results_normal$Time_Sec, 
      type = "b", pch = 19, col = "red",
      main = "Computation Time by Alpha",
      xlab = "Alpha", ylab = "Time (seconds)")
