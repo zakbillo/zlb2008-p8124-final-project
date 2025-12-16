@@ -28,157 +28,95 @@ X_normal <- read_csv("data/X_normal.csv")
 X_normal <- as.data.frame(X_normal)
 ```
 
-Run Lasso for the "HLA-DQB1" neighborhood and Compare lamda options for optimal selection
+Run Lasso for the "DOCK9" neighborhood and Compare lamda options for optimal selection
 
 ```{r}
-y <- as.numeric(X_filtered[, "HLA-DQB1"])
-x <- as.matrix(X_filtered[, setdiff(colnames(X_filtered), "HLA-DQB1")])
+library(glmnet)
+library(doParallel)
 
-# Test alphas from 0.1 to 1.0. 
-alpha_seq <- seq(0.1, 1, by = 0.1)
-cv_results <- lapply(alpha_seq, function(a) {
-  cv.glmnet(x, y, alpha = a, nfolds = 10) 
-})
+# 1. Setup Data: Target DOCK9
+# Yes, this correctly targets DOCK9. By setting y = DOCK9, you are asking
+# the Lasso to find which other genes (x) are most predictive of DOCK9.
+y <- as.numeric(X_filtered[, "DOCK9"])
+x <- as.matrix(X_filtered[, setdiff(colnames(X_filtered), "DOCK9")])
 
-# Alpha with minimum mean cross-validated error
-min_errors <- sapply(cv_results, function(cv) min(cv$cvm))
-best_alpha_idx <- which.min(min_errors)
-best_alpha <- alpha_seq[best_alpha_idx]
+# 2. Generate a fixed Lambda Sequence
+# We MUST do this once on the full data so every bootstrap iteration 
+# uses the exact same grid. Otherwise, the matrices won't match up.
+full_fit <- glmnet(x, y, alpha = 1) 
+lambda_seq <- full_fit$lambda 
 
-print(paste("Optimal Alpha found:", best_alpha))
-
-# Run Model with criteria
-full_fit <- glmnet(x, y, alpha = best_alpha)
-lambda_seq <- full_fit$lambda
-
-n <- nrow(x)
-p <- ncol(x)
-
-# RSS Calculation
-RSS <- (1 - full_fit$dev.ratio) * full_fit$nulldev
-df <- full_fit$df
-
-# Criteria
-aic <- n * log(RSS / n) + 2 * df
-bic <- n * log(RSS / n) + log(n) * df
-
-# EBIC
-gamma <- 0.5
-ebic <- bic + 2 * gamma * lchoose(p, df)
-
-# Optimal lambdas
-opt_lambda_aic  <- lambda_seq[which.min(aic)]
-opt_lambda_bic  <- lambda_seq[which.min(bic)]
-opt_lambda_ebic <- lambda_seq[which.min(ebic)]
-```
-
-Visualization for Lasso approach
-
-```{r}
-criteria_df <- data.frame(
-  LogLambda = log(lambda_seq),
-  AIC = scale(aic), 
-  BIC = scale(bic),
-  EBIC = scale(ebic)
-)
-
-criteria_long <- melt(criteria_df, id.vars = "LogLambda")
-
-p1 <- ggplot(criteria_long, aes(x = LogLambda, y = value, color = variable)) +
-  geom_line(size = 1) +
-  geom_vline(xintercept = log(opt_lambda_ebic), linetype="dashed", color="darkgreen") +
-  annotate("text", x=log(opt_lambda_ebic), y=max(criteria_long$value), 
-
-           label="EBIC", hjust=-0.1, color="darkgreen") +
-  geom_vline(xintercept = log(opt_lambda_bic), linetype="dashed", color="orange") +
-  annotate("text", x=log(opt_lambda_bic), y=max(criteria_long$value), 
-
-           label="BIC", hjust=1.1, color="orange") +
-  geom_vline(xintercept = log(opt_lambda_aic), linetype="dashed", color="purple") +
-  annotate("text", x=log(opt_lambda_aic), y=max(criteria_long$value), 
-           label="AIC", hjust=-0.1, color="purple") +
-  labs(title = paste("Model Selection (Alpha =", best_alpha, ")"), y = "Standardized Score") +
-  theme_minimal()
-
-print(p1)
-```
-
-Gene count at each optimal log Lambda (AIC, BIC or EBIC)
-
-```{r}
-get_gene_count <- function(fit, lambda_val) {
-  coefs <- coef(fit, s = lambda_val)
-  sum(as.matrix(coefs) != 0) - 1 # Minus intercept
-}
-
-cat("Genes at AIC:", get_gene_count(full_fit, opt_lambda_aic), "\n")
-cat("Genes at BIC:", get_gene_count(full_fit, opt_lambda_bic), "\n")
-cat("Genes at EBIC:", get_gene_count(full_fit, opt_lambda_ebic), "\n")
-```
-
-Going with BIC, but increasing the BIC threshold to 24 (25 genes including target) using stability selection at the optimal BIC lambda and 1000, n/2 bootstraps for FDR control as described by Meinshausen & Bühlmann, 2010. This is because other approaches are either too sparse (EBIC) or large (AIC)
-
-```{r}
-n_stab_boot <- 10000
+n_stab_boot <- 10000 
 n_cores <- detectCores() - 1
 cl <- makeCluster(n_cores)
 registerDoParallel(cl)
 
-# Subsampling function
-run_lasso_sub <- function(x, y, lambdas, alpha_val) {
+# 3. Subsampling function (Alpha fixed to 1)
+run_lasso_sub <- function(x, y, lambdas) {
+  # Subsample 50% without replacement
   sub_idx <- sample(1:nrow(x), floor(nrow(x))/2, replace = FALSE)
-  fit <- glmnet(x[sub_idx,], y[sub_idx], alpha = alpha_val, lambda = lambdas)
+  
+  # Run glmnet with the FIXED lambda sequence and alpha = 1
+  fit <- glmnet(x[sub_idx,], y[sub_idx], alpha = 1, lambda = lambdas)
+  
+  # Return binary matrix (1 if selected, 0 if not)
   coefs <- coef(fit, s = lambdas)
   return(as.matrix(coefs[-1, ] != 0) * 1) 
 }
 
-# Export Data + functions to cluster
-clusterExport(cl, c("x", "y", "lambda_seq", "run_lasso_sub", "best_alpha"))
+# Export standard lambda_seq to cluster
+clusterExport(cl, c("x", "y", "lambda_seq", "run_lasso_sub"))
 clusterEvalQ(cl, library(glmnet))
 
-# Bootstrap
+# 4. Bootstrap
 message(paste("Running", n_stab_boot, "stability bootstraps..."))
 stab_list <- foreach(i = 1:n_stab_boot) %dopar% {
-  run_lasso_sub(x, y, lambda_seq, best_alpha)
+  run_lasso_sub(x, y, lambda_seq)
 }
 stopCluster(cl)
 
-# Stability probabilities
+# 5. Stability probabilities
 prob_matrix <- Reduce("+", stab_list) / n_stab_boot
 colnames(prob_matrix) <- paste0("L", 1:length(lambda_seq))
 
-# Column index at optimal BIC Lambda
-target_lambda_idx <- which.min(abs(lambda_seq - opt_lambda_bic))
+# Optimal lambda
+cv_check <- cv.glmnet(x, y, alpha = 1, lambda = lambda_seq)
+target_lambda_idx <- which(lambda_seq == cv_check$lambda.1se)
+
+# If exact match fails due to float precision, use nearest index:
+if(length(target_lambda_idx) == 0) {
+    target_lambda_idx <- which.min(abs(lambda_seq - cv_check$lambda.1se))
+}
 
 # Stability scores at that Lambda
 gene_stability_scores <- prob_matrix[, target_lambda_idx]
 
 # Create and sort df
 stability_df <- data.frame(
-  Gene = names(gene_stability_scores),
+  Gene = rownames(prob_matrix), # Use rownames from the matrix
   Stability_Prob = as.numeric(gene_stability_scores)
 )
 
 # Sort descending
 stability_df <- stability_df[order(-stability_df$Stability_Prob), ]
 
-# Top 25 genes
-top_genes <- head(stability_df$Gene, 25)
+# Top genes
+top_genes <- head(stability_df$Gene, 100)
 
-# Include HLA-DQB1
-final_genes <- unique(c("HLA-DQB1", top_genes))
+# Include DOCK9 at the top of the list
+final_genes <- unique(c("DOCK9", top_genes))
 
-# Remove the weakest gene after adding HLA-DQB1 back in
-if(length(final_genes) > 25) {
-  final_genes <- final_genes[1:25]
+# Keep top 100 (Including DOCK9)
+if(length(final_genes) > 100) {
+  final_genes <- final_genes[1:100]
 }
 
 # Save 
 X_asthma_stable <- X_asthma[, final_genes]
-write.csv(X_asthma_stable, "data/X_asthma_stable_25.csv", row.names = FALSE)
+write.csv(X_asthma_stable, "data/X_asthma_stable.csv", row.names = FALSE)
 
 X_normal_stable <- X_normal[, final_genes]
-write.csv(X_normal_stable, "data/X_normal_stable_25.csv", row.names = FALSE)
+write.csv(X_normal_stable, "data/X_normal_stable.csv", row.names = FALSE)
 ```
 
 Plot PAGs 
@@ -216,7 +154,7 @@ analyze_pag_sensitivity <- function(data, title = NULL, file_name = NULL) {
     
     timer <- system.time({
       pag.est <- fci(suffStat, indepTest = gaussCItest, alpha = alpha, 
-                     labels = colnames(data), verbose = FALSE)
+                     labels = colnames(data), verbose = FALSE, m.max = 4)
     })
     
     # Extract elapsed time
@@ -248,10 +186,10 @@ analyze_pag_sensitivity <- function(data, title = NULL, file_name = NULL) {
   return(results_df)
 }
 
-results_asthma <- analyze_pag_sensitivity(X_asthma_top,
+results_asthma <- analyze_pag_sensitivity(X_asthma_stable,
                                           file_name = "Asthma_PAG_Analysis.pdf")
 
-results_normal <- analyze_pag_sensitivity(X_normal_top,
+results_normal <- analyze_pag_sensitivity(X_normal_stable,
                                           file_name = "Normal_PAG_Analysis.pdf")
 
 print(results_asthma)
@@ -269,89 +207,84 @@ plot(results_normal$Alpha, results_normal$Time_Sec,
      xlab = "Alpha", ylab = "Time (seconds)")
 ```
 
-Use LV-IDA to see the causal effect of HLA-DQB1 on other genes
+Go with alpha = 0.05, use LV-IDA to see the causal effect of DOCK9 on other genes
 
 ```{r}
-library(pcalg)
-
-# Ensure your function is loaded
 source("lv-ida/lvida.R") 
 source("lv-ida/iscyclic.R")
 
-estimate_downstream_effects <- function(data, cause_var, n_boots = 500, title = NULL, file_name = NULL) {
+library(pcalg)
+# Ensure these files are loaded
+if(!exists("lvida")) source("lv-ida/lvida.R") 
+if(!exists("is.cyclic")) source("lv-ida/iscyclic.R")
+
+estimate_downstream_effects_no_plot <- function(data, cause_var, n_boots = 100, file_name = NULL) {
   
-  # Setup
-  alphas <- c(0.01, 0.05, 0.10)
+  # 1. Setup
+  alphas <- c(0.05)
   cause_idx <- which(colnames(data) == cause_var)
   
   if (length(cause_idx) == 0) stop("Cause variable not found in data.")
   
-  # "Predictors" here are actually potential TARGETS (Effects)
   potential_targets <- colnames(data)[-cause_idx]
   n_targets <- length(potential_targets)
   n_obs <- nrow(data)
   
   final_summary <- data.frame()
   
-  # Title/File setup
-  if (is.null(title)) title <- paste("Downstream Analysis | Cause:", cause_var)
+  # 2. File Name Setup (CSV Only)
+  clean_cause <- gsub("[^[:alnum:]]", "_", cause_var)
+  
   if (is.null(file_name)) {
-    clean_cause <- gsub("[^[:alnum:]]", "_", cause_var)
-    file_name <- paste0("Downstream_Effects_", clean_cause, ".pdf")
     csv_name <- paste0("Downstream_Effects_", clean_cause, ".csv")
   } else {
-    # derive csv name from pdf name
-    csv_name <- sub(".pdf$", ".csv", file_name)
+    # Ensure it ends in .csv
+    csv_name <- ifelse(grepl("\\.csv$", file_name), file_name, paste0(file_name, ".csv"))
   }
-  
-  pdf(file_name, width = 12, height = 10)
   
   for (alpha in alphas) {
     message(paste("\n=== Processing Alpha =", alpha, "==="))
     
-    # Rows = Targets, Cols = Bootstrap Iterations
+    # Storage matrices
     boot_min_effects <- matrix(NA, nrow = n_targets, ncol = n_boots)
     boot_max_effects <- matrix(NA, nrow = n_targets, ncol = n_boots)
     
-    # --- BOOTSTRAP LOOP ---
+    # 3. Bootstrap Loop
     for (b in 1:n_boots) {
-      if (b %% 50 == 0) message(paste("  Bootstrap", b, "/", n_boots))
+      if (b %% 10 == 0) message(paste("   Bootstrap", b, "/", n_boots))
       
       # Resample
       boot_indices <- sample(1:n_obs, n_obs, replace = TRUE)
       boot_data <- data[boot_indices, ]
       
-      # Re-calculate stats
-      suffStat <- list(C = cor(boot_data, use = "complete.obs"), n = n_obs)
-      mcov <- cov(boot_data, use = "complete.obs")
+      # Stats
+      suffStat <- list(C = cor(boot_data, use = "pairwise.complete.obs"), n = n_obs)
+      mcov <- cov(boot_data, use = "pairwise.complete.obs")
       
       # Run FCI
       pag.est <- tryCatch({
-        fci(suffStat, indepTest = gaussCItest, alpha = alpha, labels = colnames(data), verbose = FALSE)
+        fci(suffStat, indepTest = gaussCItest, alpha = alpha, 
+            labels = colnames(data), verbose = FALSE, m.max = 4)
       }, error = function(e) return(NULL))
       
       if (is.null(pag.est)) next
       
       amat <- pag.est@amat
       
-      # Loop through potential DOWNSTREAM targets
+      # Check Targets
       for (i in seq_along(potential_targets)) {
         target_name <- potential_targets[i]
         target_idx <- which(colnames(data) == target_name)
         
-        # --- LOGIC FLIP: Check if Cause -> Target is possible ---
-        # We check if 'target_idx' is in the descendants of 'cause_idx'
+        # Optimization: Only run IDA if target is a possible descendant
         is_possible_descendant <- target_idx %in% pcalg::possibleDe(amat, cause_idx)
         
         if (!is_possible_descendant) {
           boot_min_effects[i, b] <- 0
           boot_max_effects[i, b] <- 0
         } else {
-          
-          # --- DYNAMIC FUNCTION CALL ---
           tryCatch({
             if (exists("lvida", mode = "function")) {
-               # args: x (cause), y (effect), cov, graph
                effs <- lvida(cause_idx, target_idx, mcov, amat)
             } else {
                effs <- lvIda(cause_idx, target_idx, mcov, amat)
@@ -372,7 +305,7 @@ estimate_downstream_effects <- function(data, cause_var, n_boots = 500, title = 
       }
     } 
     
-    # Summarize Results for this alpha
+    # 4. Summarize Results
     alpha_summary <- data.frame(
       Target_Gene = potential_targets,
       Alpha = alpha,
@@ -383,32 +316,18 @@ estimate_downstream_effects <- function(data, cause_var, n_boots = 500, title = 
     
     alpha_summary[is.na(alpha_summary)] <- 0
     final_summary <- rbind(final_summary, alpha_summary)
-    
-    # Reference Plot
-    suffStat_full <- list(C = cor(data), n = nrow(data))
-    pag_full <- fci(suffStat_full, indepTest = gaussCItest, alpha = alpha, labels = colnames(data))
-    
-    # Label top downstream targets
-    top_targets <- alpha_summary[order(-alpha_summary$Stability_Pct), ][1:3, ]
-    caption <- paste("Top Downstream Targets:", paste(top_targets$Target_Gene, "(", round(top_targets$Stability_Pct,0), "%)", collapse=", "))
-    
-    plot(pag_full, main = paste0(title, "\nalpha=", alpha, "\n", caption))
-    
   } 
   
-  dev.off()
-  
-  # --- NEW: Save to CSV ---
+  # 5. Save CSV
   write.csv(final_summary, csv_name, row.names = FALSE)
-  message(paste("Saved edge list to:", csv_name))
+  message(paste("Saved downstream effects summary to:", csv_name))
   
   return(final_summary)
 }
 
-# --- Run ---
-# Note: 'target_var' here is actually the CAUSE variable
-results_asthma <- estimate_downstream_effects(X_asthma_HLAC, cause_var = "215175_at", n_boots = 500)
-results_normal <- estimate_downstream_effects(X_normal_HLAC, cause_var = "215175_at", n_boots = 500)
+
+results_asthma <- estimate_downstream_effects_no_plot(X_asthma_stable, "DOCK9", n_boots = 100, file_name = "Asthma_DOCK9.csv")
+results_normal <- estimate_downstream_effects_no_plot(X_normal_stable, "DOCK9", n_boots = 100, file_name = "Normal_DOCK9.csv")
 
 
 ```
