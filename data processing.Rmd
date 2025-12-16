@@ -166,7 +166,7 @@ genes_to_keep <- colnames(X_matched)[keep_condition]
 For microarray preprocessing, convert probe IDs to gene symbols, choose the highest variance probe for each gene assignment and avoid B cell confounding genes (IGH, IGK, and IGL). I only want protein encoding genes.
 
 ```{r}
-# map probes to symbols
+# map probes to symbols based on Entrez ID
 probe_annotation <- AnnotationDbi::select(
   hgu133plus2.db,
   keys     = genes_to_keep,
@@ -174,38 +174,37 @@ probe_annotation <- AnnotationDbi::select(
   columns  = c("SYMBOL", "ENTREZID", "GENENAME")
 )
 
-# filter for protein coding only
-# careful: "P$" removes pseudogenes but might hit valid genes ending in P (check your annotation style)
+# Filter for protein encoding only
 probe_annotation_clean <- probe_annotation %>%
   filter(!is.na(SYMBOL)) %>%
-  filter(!grepl("^LOC|^LINC|P$", SYMBOL)) %>% # drop predicted, lncRNA, pseudogenes
-  filter(!grepl("^IG[HKL]", SYMBOL)) %>%      # drop immunoglobulins associated with B-cells
+  filter(!grepl("^LOC|^LINC|P$", SYMBOL)) %>% # Drop predicted, lncRNA, pseudogenes
+  filter(!grepl("^IG[HKL]", SYMBOL)) %>%      # Drop immunoglobulins associated with B-cells
   distinct(PROBEID, SYMBOL, .keep_all = TRUE) %>%
   filter(PROBEID %in% colnames(X_matched))
 
 probe_ids <- probe_annotation_clean$PROBEID
 
-# calc probe variance
+# Calc probe variance
 probe_variance <- apply(
   X_matched[, probe_ids, drop = FALSE],
   2,
   var
 )
 
-# pick top probe per gene
+# Pick top probe per gene
 top_variance_probes <- probe_annotation_clean %>%
   mutate(var = probe_variance[PROBEID]) %>%
   group_by(SYMBOL) %>%
-  slice_max(var, n = 1, with_ties = FALSE) %>% # force unique row per gene
+  slice_max(var, n = 1, with_ties = FALSE) %>% # Force unique row per gene
   ungroup()
 
 write_csv(top_variance_probes, "data/top_probe_to_gene_mapping.csv")
 
-# subset expression matrix
+# Subset expression matrix
 valid_probes <- top_variance_probes$PROBEID
 X_filtered <- X_matched[, valid_probes, drop = FALSE] 
 
-# rename cols to symbols
+# Rename cols to symbols
 probe_to_gene <- setNames(
   top_variance_probes$SYMBOL,
   top_variance_probes$PROBEID

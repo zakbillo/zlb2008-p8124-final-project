@@ -11,6 +11,8 @@ library(pcalg)
 library(foreach)
 library(doParallel)
 library(reshape2)
+library(graph)
+library(stats)
 ```
 
 ## Load clean datasets
@@ -26,84 +28,85 @@ X_normal <- read_csv("data/X_normal.csv")
 X_normal <- as.data.frame(X_normal)
 ```
 
-Identify childhood asthma onset gene HLA-C or `215175_at` (based on Clay et al. 2022)
+Run Lasso for the "HLA-DQB1" neighborhood and Compare lamda options for optimal selection
 
 ```{r}
-HLA_C <- "215175_at" 
-```
+y <- as.numeric(X_filtered[, "HLA-DQB1"])
+x <- as.matrix(X_filtered[, setdiff(colnames(X_filtered), "HLA-DQB1")])
 
-Run Lasso for the HLA-C neighborhood and Compare lamda options for optimal selection
+# Test alphas from 0.1 to 1.0. 
+alpha_seq <- seq(0.1, 1, by = 0.1)
+cv_results <- lapply(alpha_seq, function(a) {
+  # nfolds=5 or 10 depending on sample size
+  cv.glmnet(x, y, alpha = a, nfolds = 10) 
+})
 
-```{r}
-y <- as.numeric(X_filtered[, HLA_C])
-x <- as.matrix(X_filtered[, setdiff(colnames(X_filtered), HLA_C)])
+# Alpha with minimum mean cross-validated error
+min_errors <- sapply(cv_results, function(cv) min(cv$cvm))
+best_alpha_idx <- which.min(min_errors)
+best_alpha <- alpha_seq[best_alpha_idx]
 
-# Define lambda sequence 
-full_fit <- glmnet(x, y, alpha = 1)
+print(paste("Optimal Alpha found:", best_alpha))
+
+# Run Model with criteria
+full_fit <- glmnet(x, y, alpha = best_alpha)
 lambda_seq <- full_fit$lambda
 
-# Calculate criteria (BIC, EBIC, AIC)
 n <- nrow(x)
 p <- ncol(x)
 
-# Extract stats
-# For gaussian family, 'deviance' returned by glmnet is the RSS (Residual Sum of Squares)
+# RSS Calculation
 RSS <- (1 - full_fit$dev.ratio) * full_fit$nulldev
 df <- full_fit$df
 
-# Calculate Criteria using Log-Likelihood approximation
-# (Adding the constant 'n' or 'n*log(2*pi)' doesn't change the minimum, so we omit it)
+# Criteria
 aic <- n * log(RSS / n) + 2 * df
 bic <- n * log(RSS / n) + log(n) * df
 
 # EBIC
-# Gamma = 0.5 is standard for cases where p >> n (high-dimensional data)
 gamma <- 0.5
 ebic <- bic + 2 * gamma * lchoose(p, df)
 
-# Find optimal lambdas
+# Optimal lambdas
 opt_lambda_aic  <- lambda_seq[which.min(aic)]
 opt_lambda_bic  <- lambda_seq[which.min(bic)]
 opt_lambda_ebic <- lambda_seq[which.min(ebic)]
 ```
 
-Stability selection at 1000 bootstraps
+Stability selection at 1000, n/2 bootstraps for FDR control as described by Meinshausen & Bühlmann, 2010
 
 ```{r}
-# Lambda stability selection (1000 bootstraps)
 n_stab_boot <- 1000
 n_cores <- detectCores() - 1
 cl <- makeCluster(n_cores)
 registerDoParallel(cl)
 
-# Function run lasso and return binary inclusion matrix
-run_lasso_sub <- function(x, y, lambdas) {
-  sub_idx <- sample(1:nrow(x), floor(nrow(x)), replace = FALSE)
-  fit <- glmnet(x[sub_idx,], y[sub_idx], alpha = 1, lambda = lambdas)
-  
-  # Return matrix: 1 if coef != 0, else 0
-  return(as.matrix(coef(fit)[-1, ] != 0) * 1) 
+# Lasso
+run_lasso_sub <- function(x, y, lambdas, alpha_val) {
+  sub_idx <- sample(1:nrow(x), floor(nrow(x))/2, replace = FALSE)
+  fit <- glmnet(x[sub_idx,], y[sub_idx], alpha = alpha_val, lambda = lambdas)
+  coefs <- coef(fit, s = lambdas)
+  return(as.matrix(coefs[-1, ] != 0) * 1) 
 }
 
-# Export data
-clusterExport(cl, c("x", "y", "lambda_seq", "run_lasso_sub"))
+# Export to cluster
+clusterExport(cl, c("x", "y", "lambda_seq", "run_lasso_sub", "best_alpha"))
 clusterEvalQ(cl, library(glmnet))
 
-# Run in parallel
+# Parallelize
 stab_list <- foreach(i = 1:n_stab_boot) %dopar% {
-  run_lasso_sub(x, y, lambda_seq)
+  run_lasso_sub(x, y, lambda_seq, best_alpha)
 }
 stopCluster(cl)
 
-# Compute selection probability at each Lambda
+# Compute probability
 prob_matrix <- Reduce("+", stab_list) / n_stab_boot
-colnames(prob_matrix) <- round(log(lambda_seq), 2)
+colnames(prob_matrix) <- paste0("L", 1:length(lambda_seq)) 
 ```
 
 Visualization for Lasso approach
 
 ```{r}
-# Make a df for plotting criteria
 criteria_df <- data.frame(
   LogLambda = log(lambda_seq),
   AIC = scale(aic), 
@@ -112,26 +115,18 @@ criteria_df <- data.frame(
 )
 criteria_long <- melt(criteria_df, id.vars = "LogLambda")
 
-# Plot 
 p1 <- ggplot(criteria_long, aes(x = LogLambda, y = value, color = variable)) +
   geom_line(size = 1) +
-  
-  # EBIC Line & Label
   geom_vline(xintercept = log(opt_lambda_ebic), linetype="dashed", color="darkgreen") +
   annotate("text", x=log(opt_lambda_ebic), y=max(criteria_long$value), 
-           label="Optimal EBIC", hjust=-0.1, color="darkgreen") +
-  
-  # BIC Line & Label
+           label="EBIC", hjust=-0.1, color="darkgreen") +
   geom_vline(xintercept = log(opt_lambda_bic), linetype="dashed", color="orange") +
   annotate("text", x=log(opt_lambda_bic), y=max(criteria_long$value), 
-           label="Optimal BIC", hjust=1.1, color="orange") +
-  
-  # AIC Line & Label
+           label="BIC", hjust=1.1, color="orange") +
   geom_vline(xintercept = log(opt_lambda_aic), linetype="dashed", color="purple") +
   annotate("text", x=log(opt_lambda_aic), y=max(criteria_long$value), 
-           label="Optimal AIC", hjust=-0.1, color="purple") +
-  
-  labs(title = "Model Selection Criteria (Scaled)", y = "Standardized Score") +
+           label="AIC", hjust=-0.1, color="purple") +
+  labs(title = paste("Model Selection (Alpha =", best_alpha, ")"), y = "Standardized Score") +
   theme_minimal()
 
 print(p1)
@@ -140,146 +135,132 @@ print(p1)
 Gene count at each optimal log Lambda (AIC, BIC or EBIC)
 
 ```{r}
-opt_lambda_aic  <- exp(criteria_df$LogLambda[which.min(criteria_df$AIC)])
-opt_lambda_bic  <- exp(criteria_df$LogLambda[which.min(criteria_df$BIC)])
-opt_lambda_ebic <- exp(criteria_df$LogLambda[which.min(criteria_df$EBIC)])
-
-# Helper function
 get_gene_count <- function(fit, lambda_val) {
   coefs <- coef(fit, s = lambda_val)
-  n_genes <- sum(as.matrix(coefs) != 0) - 1
-  return(n_genes)
+  sum(as.matrix(coefs) != 0) - 1 # Minus intercept
 }
 
-# Counts
-count_aic  <- get_gene_count(full_fit, opt_lambda_aic) #281
-count_bic  <- get_gene_count(full_fit, opt_lambda_bic) #4, way too sparse
-count_ebic <- get_gene_count(full_fit, opt_lambda_ebic) #3, way too sparse
+cat("Genes at AIC:", get_gene_count(full_fit, opt_lambda_aic), "\n")
+cat("Genes at BIC:", get_gene_count(full_fit, opt_lambda_bic), "\n")
+cat("Genes at EBIC:", get_gene_count(full_fit, opt_lambda_ebic), "\n")
 ```
 
-Going with a consensus heuristic due to approaches being either too sparse or large at 1000 bootstraps
+Going with BIC due to other approaches being either too sparse or large at 1000 bootstraps
 
 ```{r}
-# 1. Standardize the metrics (matching your plot)
-scale_vec <- function(x) as.vector(scale(x))
-scaled_aic <- scale_vec(aic)
-scaled_bic <- scale_vec(bic)
+coefs_final <- coef(full_fit, s = opt_lambda_bic)
 
-# 2. Find the index where the difference between AIC and BIC is smallest
-# This is the mathematical "intersection" of the lines in your plot
-diff_metric <- abs(scaled_aic - scaled_bic)
-intersection_idx <- which.min(diff_metric)
-
-# 3. Get the Lambda and Gene Count at this intersection
-opt_lambda_intersect <- lambda_seq[intersection_idx]
-count_intersect <- get_gene_count(full_fit, opt_lambda_intersect)
-
-# 4. Print the result
-cat("--- Consensus Heuristic ---\n")
-cat("Intersection Log(Lambda):", log(opt_lambda_intersect), "\n")
-cat("Gene Count at Intersection:", count_intersect, "\n")
-
-# Recommendation Logic
-if(count_intersect >= 10 & count_intersect <= 80) {
-  cat("VERDICT: Perfect. Use this lambda for FCI.\n")
-} else {
-  cat("VERDICT: Still off. Consider manually forcing top 30-50 genes.\n")
-}
-```
-
-Choose top 25 from consensus heuristic for a more computationally feasible dataset
-
-```{r}
-# 1. Get coefficients from the intersection model
-# (Using the 'opt_lambda_intersect' you calculated earlier)
-coefs_final <- coef(full_fit, s = opt_lambda_intersect)
-
-# 2. Convert to data frame for sorting
+# Convert to df
 coefs_df <- data.frame(
   Gene = rownames(coefs_final),
   Coefficient = as.numeric(coefs_final)
 )
 
-# 3. Remove Intercept and Zero-coefficient genes
+# Remove intercept and zero-coefficient genes
 coefs_df <- coefs_df[coefs_df$Gene != "(Intercept)" & coefs_df$Coefficient != 0, ]
 
-# 4. Sort by Absolute Strength (Magnitude)
-# This prioritizes the strongest signals regardless of direction (+/-)
+# Sort by absolute strength 
 coefs_df$Abs_Coef <- abs(coefs_df$Coefficient)
 coefs_df <- coefs_df[order(-coefs_df$Abs_Coef), ]
+selected_genes <- coefs_df$Gene
 
-# --- DECISION POINT: TOP 25 ---
-top_n <- 25
-top_genes <- head(coefs_df$Gene, top_n)
-
-# 5. Create the "Safe" Datasets
-# CRITICAL STEP: Combine HLA_C (Target) with the Top Genes
-vars_to_keep_safe <- c(HLA_C, top_genes)
+# Create final data
+vars_to_keep_safe <- c("HLA-DQB1", selected_genes)
 
 # Subset the asthma and normal datasets
-X_asthma_top25 <- X_asthma[, vars_to_keep_safe]
-X_normal_top25 <- X_normal[, vars_to_keep_safe]
+X_asthma_top <- X_asthma[, vars_to_keep_safe]
+X_normal_top <- X_normal[, vars_to_keep_safe]
 
-# 6. Save
-write.csv(X_asthma_top25, "data/X_asthma_top25.csv", row.names = FALSE)
-write.csv(X_normal_top25, "data/X_normal_top25.csv", row.names = FALSE)
+# Save
+write.csv(X_asthma_top, "data/X_asthma_top.csv", row.names = FALSE)
+write.csv(X_normal_top, "data/X_normal_top.csv", row.names = FALSE)
 ```
 
+Plot PAGs 
+
 ```{r}
-pag_plot <- function(data, title = NULL, file_name = NULL) {
+analyze_pag_sensitivity <- function(data, title = NULL, file_name = NULL) {
   
-  # Title setup
+  # Title and filename setup
   data_arg_name <- deparse(substitute(data)) 
   if (is.null(title)) {
     clean_name <- if(data_arg_name == ".") "Data" else data_arg_name
     title <- paste("Estimated PAG:", clean_name)
   }
   
-  alphas <- c(0.01, 0.05, 0.10)
-  
-  # Store results in a df
-  edge_counts <- data.frame(Alpha = numeric(), Edge_Count = integer())
-
-  # Filename setup
   if (is.null(file_name)) {
     clean_title <- gsub("[^[:alnum:]]", "_", title)
     file_name <- paste0(clean_title, ".pdf")
   }
-
-  suffStat <- list(C = cor(data), n = nrow(data))
+  
+  # Define alphas
+  alphas <- c(0.01, 0.05, 0.10)
+  
+  # Initialize results df
+  results_df <- data.frame(Alpha = numeric(), 
+                            Edge_Count = integer(), 
+                            Time_Sec = numeric())
+  
+  # suffStat
+  suffStat <- list(C = cor(data, use = "pairwise.complete.obs"), n = nrow(data))
   
   pdf(file_name, width = 10, height = 10)
   
   for (alpha in alphas) {
     
-    # Run FCI
-    pag.est <- fci(suffStat, indepTest = gaussCItest, alpha = alpha, labels = colnames(data))
+    message(paste("Running FCI for Alpha:", alpha, "..."))
     
-    # Extract amat
+    # system.time
+    pag.est <- NULL
+    
+    timer <- system.time({
+      pag.est <- fci(suffStat, indepTest = gaussCItest, alpha = alpha, 
+                     labels = colnames(data), verbose = FALSE)
+    })
+    
+    # Extract elapsed time
+    duration <- timer["elapsed"]
+    
+    # Count Edges
     amat <- pag.est@amat
-    
-    # Count non-zero entries in the upper triangle
     current_edges <- sum(amat[upper.tri(amat)] != 0)
     
-    # Append to results
-    edge_counts <- rbind(edge_counts, data.frame(Alpha = alpha, Edge_Count = current_edges))
+    # Store Results
+    results_df <- rbind(results_df, data.frame(Alpha = alpha, 
+                                                 Edge_Count = current_edges, 
+                                                 Time_Sec = as.numeric(duration)))
     
-    # Plot
-    page_title <- paste0(title, " (alpha = ", alpha, " | Edges = ", current_edges, ")")
-    plot(pag.est, main = page_title)
+    # Plot PAG
+    plot(pag.est)
+    
+    # Title
+    title_text <- paste0(title, 
+                         "\nALPHA: ", alpha, 
+                         "   |   Edges: ", current_edges, 
+                         "   |   Time: ", round(duration, 3), "s")
+    
+    title(main = title_text, col.main = "blue", cex.main = 1.5)
   }
   
   dev.off()
   
-  # Return the table of counts
-  return(edge_counts)
+  return(results_df)
 }
 
-counts_asthma <- pag_plot(X_asthma_top25)
-print(counts_asthma) # 15 at 0.01, 17 at 0.05, 21 at 0.10
+results_asthma <- analyze_pag_sensitivity(X_asthma_top, 
+                                          title = "Asthma PAG Analysis", 
+                                          file_name = "Asthma_PAG_Analysis.pdf")
+
+print(results_asthma)
+
+# Visualization of the runtime
+plot(results_asthma$Alpha, results_asthma$Time_Sec, 
+     type = "b", pch = 19, col = "red",
+     main = "Computation Time by Alpha",
+     xlab = "Alpha", ylab = "Time (seconds)")
 ```
 
-Use LV-IDA to see the causal effect of HLA-C on other genes
+Use LV-IDA to see the causal effect of HLA-DQB1 on other genes
 
 ```{r}
 library(pcalg)
