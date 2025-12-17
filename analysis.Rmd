@@ -13,6 +13,7 @@ library(doParallel)
 library(reshape2)
 library(graph)
 library(stats)
+library(boot)
 ```
 
 ## Load clean datasets
@@ -28,17 +29,14 @@ X_normal <- read_csv("data/X_normal.csv")
 X_normal <- as.data.frame(X_normal)
 ```
 
-Run Lasso for the "DOCK9" neighborhood and Compare lamda options for optimal selection
+Run Lasso for the "MAP3K5−AS2" neighborhood and Compare lamda options for optimal selection
 
 ```{r}
-library(glmnet)
-library(doParallel)
-
-# 1. Setup Data: Target DOCK9
-# Yes, this correctly targets DOCK9. By setting y = DOCK9, you are asking
-# the Lasso to find which other genes (x) are most predictive of DOCK9.
-y <- as.numeric(X_filtered[, "DOCK9"])
-x <- as.matrix(X_filtered[, setdiff(colnames(X_filtered), "DOCK9")])
+# 1. Setup Data: Target MAP3K5−AS2
+# Yes, this correctly targets MAP3K5−AS2. By setting y = MAP3K5−AS2, you are asking
+# the Lasso to find which other genes (x) are most predictive of MAP3K5−AS2.
+y <- as.numeric(X_filtered[, "MAP3K5-AS2"])
+x <- as.matrix(X_filtered[, setdiff(colnames(X_filtered), "MAP3K5-AS2")])
 
 # 2. Generate a fixed Lambda Sequence
 # We MUST do this once on the full data so every bootstrap iteration 
@@ -100,29 +98,32 @@ stability_df <- data.frame(
 # Sort descending
 stability_df <- stability_df[order(-stability_df$Stability_Prob), ]
 
-# Top genes
-top_genes <- head(stability_df$Gene, 100)
+# Top 25 genes
+top_genes <- head(stability_df$Gene, 25)
 
-# Include DOCK9 at the top of the list
-final_genes <- unique(c("DOCK9", top_genes))
+# Include MAP3K5-AS2at the top of the list
+final_genes <- unique(c("MAP3K5-AS2", top_genes))
 
-# Keep top 100 (Including DOCK9)
-if(length(final_genes) > 100) {
-  final_genes <- final_genes[1:100]
+# Keep top 25 (Including MAP3K5-AS2)
+if(length(final_genes) > 25) {
+  final_genes <- final_genes[1:25]
 }
 
 # Save 
 X_asthma_stable <- X_asthma[, final_genes]
-write.csv(X_asthma_stable, "data/X_asthma_stable.csv", row.names = FALSE)
+write.csv(X_asthma_stable, "data/X_asthma_stable.csv")
 
 X_normal_stable <- X_normal[, final_genes]
-write.csv(X_normal_stable, "data/X_normal_stable.csv", row.names = FALSE)
+write.csv(X_normal_stable, "data/X_normal_stable.csv")
+
+X_filtered_stable <- X_filtered[, final_genes]
+write.csv(X_filtered_stable, "data/X_normal_stable.csv")
 ```
 
-Plot PAGs 
+Plot PAGs with FCI
 
 ```{r}
-analyze_pag_sensitivity <- function(data, title = NULL, file_name = NULL) {
+analyze_pag_sensitivity_fci <- function(data, title = NULL, file_name = NULL) {
   
   # Filename setup
   data_arg_name <- deparse(substitute(data)) 
@@ -186,14 +187,18 @@ analyze_pag_sensitivity <- function(data, title = NULL, file_name = NULL) {
   return(results_df)
 }
 
-results_asthma <- analyze_pag_sensitivity(X_asthma_stable,
-                                          file_name = "Asthma_PAG_Analysis.pdf")
+results_asthma <- analyze_pag_sensitivity_fci(X_asthma_stable,
+                                          file_name = "fci_Asthma_PAG_Analysis.pdf")
 
-results_normal <- analyze_pag_sensitivity(X_normal_stable,
-                                          file_name = "Normal_PAG_Analysis.pdf")
+results_normal <- analyze_pag_sensitivity_fci(X_normal_stable,
+                                          file_name = "fci_Normal_PAG_Analysis.pdf")
+
+results_filtered <- analyze_pag_sensitivity_fci(X_filtered_stable,
+                                          file_name = "fci_Filtered_PAG_Analysis.pdf")
 
 print(results_asthma)
 print(results_normal)
+print(results_filtered)
 
 # Visualize runtime
 plot(results_asthma$Alpha, results_asthma$Time_Sec, 
@@ -205,130 +210,431 @@ plot(results_normal$Alpha, results_normal$Time_Sec,
      type = "b", pch = 19, col = "red",
      main = "Computation Time by Alpha",
      xlab = "Alpha", ylab = "Time (seconds)")
+
+plot(results_filtered$Alpha, results_filtered$Time_Sec, 
+     type = "b", pch = 19, col = "red",
+     main = "Computation Time by Alpha",
+     xlab = "Alpha", ylab = "Time (seconds)")
 ```
 
-Go with alpha = 0.05, use LV-IDA to see the causal effect of DOCK9 on other genes
+Plot PAGs with RFCI
 
 ```{r}
-source("lv-ida/lvida.R") 
-source("lv-ida/iscyclic.R")
-
-library(pcalg)
-# Ensure these files are loaded
-if(!exists("lvida")) source("lv-ida/lvida.R") 
-if(!exists("is.cyclic")) source("lv-ida/iscyclic.R")
-
-estimate_downstream_effects_no_plot <- function(data, cause_var, n_boots = 100, file_name = NULL) {
+analyze_pag_sensitivity_rfci <- function(data, title = NULL, file_name = NULL) {
   
-  # 1. Setup
-  alphas <- c(0.05)
-  cause_idx <- which(colnames(data) == cause_var)
-  
-  if (length(cause_idx) == 0) stop("Cause variable not found in data.")
-  
-  potential_targets <- colnames(data)[-cause_idx]
-  n_targets <- length(potential_targets)
-  n_obs <- nrow(data)
-  
-  final_summary <- data.frame()
-  
-  # 2. File Name Setup (CSV Only)
-  clean_cause <- gsub("[^[:alnum:]]", "_", cause_var)
+  # Filename setup
+  data_arg_name <- deparse(substitute(data)) 
   
   if (is.null(file_name)) {
-    csv_name <- paste0("Downstream_Effects_", clean_cause, ".csv")
-  } else {
-    # Ensure it ends in .csv
-    csv_name <- ifelse(grepl("\\.csv$", file_name), file_name, paste0(file_name, ".csv"))
+    clean_title <- gsub("[^[:alnum:]]", "_", title)
+    file_name <- paste0(clean_title, ".pdf")
   }
   
+  # Define alphas
+  alphas <- c(0.01, 0.05, 0.10)
+  
+  # Initialize results df
+  results_df <- data.frame(Alpha = numeric(), 
+                            Edge_Count = integer(), 
+                            Time_Sec = numeric())
+  
+  # suffStat
+  suffStat <- list(C = cor(data, use = "pairwise.complete.obs"), n = nrow(data))
+  
+  pdf(file_name, width = 10, height = 10)
+  
   for (alpha in alphas) {
-    message(paste("\n=== Processing Alpha =", alpha, "==="))
     
-    # Storage matrices
-    boot_min_effects <- matrix(NA, nrow = n_targets, ncol = n_boots)
-    boot_max_effects <- matrix(NA, nrow = n_targets, ncol = n_boots)
+    message(paste("Running FCI for Alpha:", alpha, "..."))
     
-    # 3. Bootstrap Loop
-    for (b in 1:n_boots) {
-      if (b %% 10 == 0) message(paste("   Bootstrap", b, "/", n_boots))
-      
-      # Resample
-      boot_indices <- sample(1:n_obs, n_obs, replace = TRUE)
-      boot_data <- data[boot_indices, ]
-      
-      # Stats
-      suffStat <- list(C = cor(boot_data, use = "pairwise.complete.obs"), n = n_obs)
-      mcov <- cov(boot_data, use = "pairwise.complete.obs")
-      
-      # Run FCI
-      pag.est <- tryCatch({
-        fci(suffStat, indepTest = gaussCItest, alpha = alpha, 
-            labels = colnames(data), verbose = FALSE, m.max = 4)
-      }, error = function(e) return(NULL))
-      
-      if (is.null(pag.est)) next
-      
-      amat <- pag.est@amat
-      
-      # Check Targets
-      for (i in seq_along(potential_targets)) {
-        target_name <- potential_targets[i]
-        target_idx <- which(colnames(data) == target_name)
-        
-        # Optimization: Only run IDA if target is a possible descendant
-        is_possible_descendant <- target_idx %in% pcalg::possibleDe(amat, cause_idx)
-        
-        if (!is_possible_descendant) {
-          boot_min_effects[i, b] <- 0
-          boot_max_effects[i, b] <- 0
-        } else {
-          tryCatch({
-            if (exists("lvida", mode = "function")) {
-               effs <- lvida(cause_idx, target_idx, mcov, amat)
-            } else {
-               effs <- lvIda(cause_idx, target_idx, mcov, amat)
-            }
-            
-            if (!all(is.na(effs))) {
-              boot_min_effects[i, b] <- min(abs(effs))
-              boot_max_effects[i, b] <- max(abs(effs))
-            } else {
-              boot_min_effects[i, b] <- 0
-              boot_max_effects[i, b] <- 0
-            }
-          }, error = function(e) {
-             boot_min_effects[i, b] <- NA
-             boot_max_effects[i, b] <- NA
-          })
-        }
-      }
-    } 
+    # system.time
+    pag.est <- NULL
     
-    # 4. Summarize Results
-    alpha_summary <- data.frame(
-      Target_Gene = potential_targets,
-      Alpha = alpha,
-      Stability_Pct = rowMeans(boot_max_effects > 0, na.rm = TRUE) * 100,
-      Median_Min_Effect = apply(boot_min_effects, 1, function(x) median(x[x > 0], na.rm = TRUE)),
-      Median_Max_Effect = apply(boot_max_effects, 1, function(x) median(x[x > 0], na.rm = TRUE))
-    )
+    timer <- system.time({
+      pag.est <- rfci(suffStat, indepTest = gaussCItest, alpha = alpha, 
+                     labels = colnames(data), verbose = FALSE, m.max = 4)
+    })
     
-    alpha_summary[is.na(alpha_summary)] <- 0
-    final_summary <- rbind(final_summary, alpha_summary)
-  } 
+    # Extract elapsed time
+    duration <- timer["elapsed"]
+    
+    # Count Edges
+    amat <- pag.est@amat
+    current_edges <- sum(amat[upper.tri(amat)] != 0)
+    
+    # Store Results
+    results_df <- rbind(results_df, data.frame(Alpha = alpha, 
+                                                 Edge_Count = current_edges, 
+                                                 Time_Sec = as.numeric(duration)))
+    
+    # Plot PAG
+    plot(pag.est)
+    
+    # Title
+    title_text <- paste0(title, 
+                         "\nalpha: ", alpha, 
+                         "   edges: ", current_edges, 
+                         "   time: ", round(duration, 3), "s")
+    
+    title(main = title_text, col.main = "blue", cex.main = 1.5)
+  }
   
-  # 5. Save CSV
-  write.csv(final_summary, csv_name, row.names = FALSE)
-  message(paste("Saved downstream effects summary to:", csv_name))
+  dev.off()
   
-  return(final_summary)
+  return(results_df)
 }
 
+results_asthma <- analyze_pag_sensitivity_rfci(X_asthma_stable,
+                                          file_name = "rfci_Asthma_PAG_Analysis.pdf")
 
-results_asthma <- estimate_downstream_effects_no_plot(X_asthma_stable, "DOCK9", n_boots = 100, file_name = "Asthma_DOCK9.csv")
-results_normal <- estimate_downstream_effects_no_plot(X_normal_stable, "DOCK9", n_boots = 100, file_name = "Normal_DOCK9.csv")
+results_normal <- analyze_pag_sensitivity_rfci(X_normal_stable,
+                                          file_name = "rfci_Normal_PAG_Analysis.pdf")
+
+results_filtered <- analyze_pag_sensitivity_rfci(X_filtered_stable,
+                                          file_name = "rfci_Filtered_PAG_Analysis.pdf")
+
+print(results_asthma)
+print(results_normal)
+print(results_filtered)
+
+# Visualize runtime
+plot(results_asthma$Alpha, results_asthma$Time_Sec, 
+     type = "b", pch = 19, col = "red",
+     main = "Computation Time by Alpha",
+     xlab = "Alpha", ylab = "Time (seconds)")
+
+plot(results_normal$Alpha, results_normal$Time_Sec, 
+     type = "b", pch = 19, col = "red",
+     main = "Computation Time by Alpha",
+     xlab = "Alpha", ylab = "Time (seconds)")
+
+plot(results_filtered$Alpha, results_filtered$Time_Sec, 
+     type = "b", pch = 19, col = "red",
+     main = "Computation Time by Alpha",
+     xlab = "Alpha", ylab = "Time (seconds)")
+```
+
+Go with alpha = 0.05, use LV-IDA to see the causal effect of MAP3K5-AS2 on other genes in the full dataset to idendify targets (to make a CI for the stratified datasets and also calculate edge type percentage across bootstraps). Make a function
+
+```{r}
+library(pcalg)
+library(dplyr)
+library(boot)
+
+# Ensure external scripts are loaded
+if(file.exists("lv-ida/lvida.R")) source("lv-ida/lvida.R") 
+if(file.exists("lv-ida/iscyclic.R")) source("lv-ida/iscyclic.R")
+
+run_lv_ida_pipeline <- function(
+    data, 
+    group_name = "Analysis_Group", 
+    driver_node, 
+    fixed_targets = NULL,          
+    n_top_targets = 10,            
+    n_boots = 100, 
+    alpha_val = 0.05
+) {
+  
+  # --- 1. SETUP & CHECKS ---
+  if(missing(data)) stop("Error: 'data' argument is missing.")
+  if(missing(driver_node)) stop("Error: 'driver_node' must be specified.")
+  
+  node_names <- colnames(data)
+  n_obs <- nrow(data)
+  driver_idx <- which(node_names == driver_node)
+  
+  if(length(driver_idx) == 0) stop("Driver node not found in dataset.")
+
+  # --- Helper: Safe LV-IDA Estimate ---
+  get_lv_ida_est <- function(pag_amat, cov_mat, driver_idx, target_idx) {
+    
+    # OPTIMIZATION 1: Check if Target is a Possible Descendant
+    # If target is NOT a descendant, effect is strictly 0.
+    if (! (target_idx %in% pcalg::possibleDe(pag_amat, driver_idx))) {
+      return(0)
+    }
+    
+    # Run LV-IDA if it is a descendant
+    tryCatch({
+      effs <- lv.ida(driver_idx, target_idx, cov_mat, pag_amat, method = "local")
+      # Return Conservative Estimate (Min Abs Value)
+      return(effs[which.min(abs(effs))])
+    }, error = function(e) return(NA))
+  }
+  
+  # ============================================================================
+  # PHASE 1: FULL DATASET DISCOVERY (Standardized to use COV)
+  # ============================================================================
+  print(paste("--- PHASE 1: Analyzing Full Data for", group_name, "---"))
+  
+  # Use Covariance (cov) instead of Correlation (cor) for LV-IDA accuracy
+  cov_full <- cov(data) 
+  suffStat_full <- list(C = cor(data), n = n_obs) # FCI uses correlation for tests
+  
+  # Using FCI (More accurate than RFCI)
+  fci_full <- fci(suffStat_full, indepTest = gaussCItest, alpha = alpha_val, 
+                  labels = node_names, verbose = FALSE)
+  adj_full <- fci_full@amat
+  
+  # Determine Targets
+  if (!is.null(fixed_targets)) {
+    print(paste("Using", length(fixed_targets), "pre-defined targets."))
+    final_targets <- fixed_targets
+  } else {
+    print("Discovering top targets...")
+    all_others_idx <- setdiff(1:length(node_names), driver_idx)
+    temp_effects <- numeric(length(all_others_idx))
+    names(temp_effects) <- node_names[all_others_idx]
+    
+    for (i in seq_along(all_others_idx)) {
+      t_idx <- all_others_idx[i]
+      temp_effects[i] <- get_lv_ida_est(adj_full, cov_full, driver_idx, t_idx)
+    }
+    
+    sorted <- sort(abs(temp_effects), decreasing = TRUE)
+    final_targets <- names(sorted)[1:n_top_targets]
+    print(paste("Top targets discovered:", paste(final_targets, collapse=", ")))
+  }
+  
+  # Get Point Estimates for the Final Targets
+  point_estimates <- numeric(length(final_targets))
+  names(point_estimates) <- final_targets
+  for (targ in final_targets) {
+    t_idx <- which(node_names == targ)
+    point_estimates[targ] <- get_lv_ida_est(adj_full, cov_full, driver_idx, t_idx)
+  }
+  
+  # ============================================================================
+  # PHASE 2: ROBUST BOOTSTRAP (With Cycle Checks)
+  # ============================================================================
+  print(paste("--- PHASE 2: Bootstrapping", n_boots, "iterations ---"))
+  
+  boot_effects <- matrix(NA, nrow = n_boots, ncol = length(final_targets))
+  colnames(boot_effects) <- final_targets
+  
+  skipped_count <- 0
+  
+  set.seed(123)
+  for (i in 1:n_boots) {
+    if (i %% 10 == 0) print(paste("Iteration:", i))
+    
+    # 1. Resample
+    indices <- sample(1:n_obs, replace = TRUE)
+    d_boot  <- data[indices, ]
+    cov_boot <- cov(d_boot)
+    suffStat_boot <- list(C = cor(d_boot), n = n_obs)
+    
+    # 2. Structure Learning (FCI)
+    # Wrap in tryCatch to prevent crashing on singular matrices
+    fci_boot <- tryCatch({
+      fci(suffStat_boot, indepTest = gaussCItest, alpha = alpha_val, 
+          labels = node_names, verbose = FALSE)
+    }, error = function(e) return(NULL))
+    
+    if (is.null(fci_boot)) {
+      skipped_count <- skipped_count + 1
+      next
+    }
+    
+    amat_boot <- fci_boot@amat
+    
+    # 3. SAFETY CHECK: Cycles
+    # If the graph is cyclic, LV-IDA will crash/hang. Skip this iteration.
+    if (exists("is.cyclic") && is.cyclic(amat_boot)) {
+      skipped_count <- skipped_count + 1
+      next 
+    }
+    
+    # 4. Calculate Effects
+    for (targ in final_targets) {
+      t_idx <- which(node_names == targ)
+      boot_effects[i, targ] <- get_lv_ida_est(amat_boot, cov_boot, driver_idx, t_idx)
+    }
+  }
+  
+  if (skipped_count > 0) {
+    print(paste("Warning: Skipped", skipped_count, "bootstraps due to cycles or errors."))
+  }
+  
+  # ============================================================================
+  # OUTPUTS
+  # ============================================================================
+  write.csv(boot_effects, paste0("LV_IDA_Raw_", group_name, ".csv"), row.names = FALSE)
+  
+  summary_df <- data.frame(
+    Target = final_targets,
+    Point_Estimate = point_estimates,
+    # Calculate stats ignoring NAs (skipped loops result in NAs)
+    Boot_Mean = apply(boot_effects, 2, mean, na.rm=TRUE),
+    Lower_CI  = apply(boot_effects, 2, quantile, probs=0.025, na.rm=TRUE),
+    Upper_CI  = apply(boot_effects, 2, quantile, probs=0.975, na.rm=TRUE),
+    Stability_Pct = apply(boot_effects, 2, function(x) mean(x != 0, na.rm=TRUE) * 100)
+  )
+  write.csv(summary_df, paste0("LV_IDA_Summary_", group_name, ".csv"), row.names = FALSE)
+  
+  return(list(
+    targets = final_targets,
+    adj_matrix = adj_full,
+    summary = summary_df
+  ))
+}
+```
 
 
+```{r}
+# ---------------------------------------------------------
+# STEP 1: Combined Dataset (Discovery)
+# ---------------------------------------------------------
+res_combined <- run_lv_ida_pipeline(
+  data = X_filtered_stable, 
+  group_name = "Combined", 
+  driver_node = "MAP3K5-AS2", 
+  n_top_targets = 10,
+  n_boots = 100 # Adjust as needed (100 is fast, 500 is publication standard)
+)
+
+universal_targets <- res_combined$targets
+print(paste("Universal Targets:", paste(universal_targets, collapse=", ")))
+
+# ---------------------------------------------------------
+# STEP 2: Stratified Datasets (Validation)
+# ---------------------------------------------------------
+res_normal <- run_lv_ida_pipeline(
+  data = X_normal_stable, 
+  group_name = "Normal", 
+  driver_node = "MAP3K5-AS2", 
+  fixed_targets = universal_targets,
+  n_boots = 100
+)
+
+res_asthma <- run_lv_ida_pipeline(
+  data = X_asthma_stable, 
+  group_name = "Asthma", 
+  driver_node = "MAP3K5-AS2", 
+  fixed_targets = universal_targets,
+  n_boots = 100
+)
+
+# ---------------------------------------------------------
+# STEP 3: SHD Comparison
+# ---------------------------------------------------------
+calc_shd <- function(amat1, amat2) { sum(amat1 != amat2) }
+
+shd_report <- data.frame(
+  Comparison = c("Normal vs Combined", "Asthma vs Combined", "Normal vs Asthma"),
+  SHD = c(
+    calc_shd(res_normal$adj_matrix, res_combined$adj_matrix),
+    calc_shd(res_asthma$adj_matrix, res_combined$adj_matrix),
+    calc_shd(res_normal$adj_matrix, res_asthma$adj_matrix)
+  )
+)
+
+print(shd_report)
+write.csv(shd_report, "SHD_Comparison_Report.csv", row.names = FALSE)
+```
+
+Next we examine the SHD compared to the combined dataset at alpha = 0.05
+
+```{r}
+# Load necessary libraries
+library(pcalg)
+library(igraph)
+library(dplyr)
+
+# ==============================================================================
+# SETUP: Define Inputs
+# ==============================================================================
+# 1. Define your gene of interest and top N targets
+driver_gene <- "MAP3K5-AS2"
+top_n <- 5
+
+# 2. Get the list of top targets from your PREVIOUS combined LV-IDA results
+# (Assuming 'lv_ida_summary' is your results dataframe from the previous step)
+# We filter for the driver gene and select top targets by absolute effect size
+top_targets <- lv_ida_summary %>%
+  filter(Parent == driver_gene) %>%
+  arrange(desc(abs(Min_Abs_Effect))) %>%
+  head(top_n) %>%
+  pull(Child)
+
+# Define the node set for the Local SHD (Driver + Top Targets)
+node_set_of_interest <- c(driver_gene, top_targets)
+
+print(paste("Calculating SHD for subgraph:", paste(node_set_of_interest, collapse=", ")))
+
+# ==============================================================================
+# HELPER FUNCTION: Learn Graph & Extract Subgraph
+# ==============================================================================
+get_local_graph <- function(data, nodes_of_interest, alpha = 0.05) {
+  
+  # 1. Standard PC Algorithm (or FCI if you prefer)
+  # Convert data to matrix and get correlation
+  dat_mat <- as.matrix(data)
+  n <- nrow(dat_mat)
+  p <- ncol(dat_mat)
+  suffStat <- list(C = cor(dat_mat), n = n)
+  
+  # Fit PC algorithm
+  pc_fit <- pc(suffStat, indepTest = gaussCItest, alpha = alpha, 
+               labels = colnames(dat_mat), verbose = FALSE)
+  
+  # 2. Convert to igraph object to extract subgraph
+  # pcalg returns a graphNEL object, we convert to adjacency matrix first
+  adj_mat <- as(pc_fit@graph, "matrix")
+  
+  # Subset the adjacency matrix to ONLY our nodes of interest
+  # (Check if all nodes exist in the data first to avoid errors)
+  valid_nodes <- nodes_of_interest[nodes_of_interest %in% colnames(adj_mat)]
+  sub_adj <- adj_mat[valid_nodes, valid_nodes]
+  
+  # Convert back to a graphNEL object for SHD calculation
+  # (pcalg::shd requires graphNEL or adjacency matrix)
+  return(as(sub_adj, "graphNEL"))
+}
+
+# ==============================================================================
+# EXECUTION: Calculate SHD
+# ==============================================================================
+
+# 1. Learn the Reference Graph (Combined Dataset)
+# Ensure X_filtered_stable is your numeric matrix/df of expression data
+ref_graph <- get_local_graph(X_filtered_stable, node_set_of_interest)
+
+# 2. Define your Strata (Example: Split by Median Age)
+# You need a vector 'stratification_var' that aligns with X_filtered_stable rows
+# For this example, I'll generate a dummy split. REPLACE THIS with your real clinical data.
+# Example: strata_list <- split(as.data.frame(X_filtered_stable), clinical_data$Age_Group)
+
+# Placeholder: Splitting randomly for demo purposes
+set.seed(123)
+random_split <- sample(c("Group_A", "Group_B"), nrow(X_filtered_stable), replace = TRUE)
+strata_list <- split(as.data.frame(X_filtered_stable), random_split)
+
+# 3. Loop through Strata and Compare to Combined
+results_shd <- data.frame(Stratum = character(), SHD = numeric(), stringsAsFactors = FALSE)
+
+for (stratum_name in names(strata_list)) {
+  
+  stratum_data <- strata_list[[stratum_name]]
+  
+  # Learn graph for this stratum
+  strat_graph <- get_local_graph(stratum_data, node_set_of_interest)
+  
+  # Calculate SHD between Stratum and Combined Reference
+  # Note: SHD counts edge insertions, deletions, and flips
+  dist <- pcalg::shd(ref_graph, strat_graph)
+  
+  results_shd <- rbind(results_shd, data.frame(Stratum = stratum_name, SHD = dist))
+}
+
+# ==============================================================================
+# OUTPUT
+# ==============================================================================
+print("Local Structural Hamming Distance (SHD) vs Combined Dataset:")
+print(results_shd)
+
+# Interpretation Hint:
+# Lower SHD = The causal mechanism for MAP3K5-AS2 is STABLE in this stratum.
+# Higher SHD = The mechanism in this stratum VARIES significantly from the population average.
 ```
 
