@@ -314,170 +314,280 @@ plot(results_filtered$Alpha, results_filtered$Time_Sec,
      xlab = "Alpha", ylab = "Time (seconds)")
 ```
 
-Go with alpha = 0.05, use LV-IDA to see the causal effect of MAP3K5-AS2 on other genes in the full dataset to idendify targets (to make a CI for the stratified datasets and also calculate edge type percentage across bootstraps). Make a function
+Go with alpha = 0.05, use LV-IDA and RFCI to see the causal effect of MAP3K5-AS2 on other genes in the full dataset to idendify targets (to make a CI for the stratified datasets and also calculate edge type percentage across bootstraps). Make a function
 
 ```{r}
 library(pcalg)
 library(dplyr)
 library(boot)
+library(foreach)
+library(doParallel)
 
-# Ensure external scripts are loaded
-if(file.exists("lv-ida/lvida.R")) source("lv-ida/lvida.R") 
-if(file.exists("lv-ida/iscyclic.R")) source("lv-ida/iscyclic.R")
+library(tidyverse)
 
-run_lv_ida_pipeline <- function(
-    data, 
-    group_name = "Analysis_Group", 
-    driver_node, 
-    fixed_targets = NULL,          
-    n_top_targets = 10,            
-    n_boots = 100, 
-    alpha_val = 0.05
-) {
+library(glmnet)
+
+library(pcalg)
+
+library(foreach)
+
+library(doParallel)
+
+library(reshape2)
+
+library(graph) 
+
+source("lv-ida/lvida.R") 
+
+source("lv-ida/iscyclic.R")
+
+
+
+estimate_downstream_effects_safe <- function(data, cause_var, n_boots = 500, file_name = NULL) {
+
   
-  # --- 1. SETUP & CHECKS ---
-  if(missing(data)) stop("Error: 'data' argument is missing.")
-  if(missing(driver_node)) stop("Error: 'driver_node' must be specified.")
+
+  # 1. Setup
+
+  alphas <- c(0.05)
+
+  cause_idx <- which(colnames(data) == cause_var)
+
   
-  node_names <- colnames(data)
+
+  if (length(cause_idx) == 0) stop("Cause variable not found in data.")
+
+  
+
+  potential_targets <- colnames(data)[-cause_idx]
+
+  n_targets <- length(potential_targets)
+
   n_obs <- nrow(data)
-  driver_idx <- which(node_names == driver_node)
-  
-  if(length(driver_idx) == 0) stop("Driver node not found in dataset.")
 
-  # --- Helper: Safe LV-IDA Estimate ---
-  get_lv_ida_est <- function(pag_amat, cov_mat, driver_idx, target_idx) {
-    
-    # OPTIMIZATION 1: Check if Target is a Possible Descendant
-    # If target is NOT a descendant, effect is strictly 0.
-    if (! (target_idx %in% pcalg::possibleDe(pag_amat, driver_idx))) {
-      return(0)
-    }
-    
-    # Run LV-IDA if it is a descendant
-    tryCatch({
-      effs <- lv.ida(driver_idx, target_idx, cov_mat, pag_amat, method = "local")
-      # Return Conservative Estimate (Min Abs Value)
-      return(effs[which.min(abs(effs))])
-    }, error = function(e) return(NA))
-  }
   
-  # ============================================================================
-  # PHASE 1: FULL DATASET DISCOVERY (Standardized to use COV)
-  # ============================================================================
-  print(paste("--- PHASE 1: Analyzing Full Data for", group_name, "---"))
+
+  final_summary <- data.frame()
+
   
-  # Use Covariance (cov) instead of Correlation (cor) for LV-IDA accuracy
-  cov_full <- cov(data) 
-  suffStat_full <- list(C = cor(data), n = n_obs) # FCI uses correlation for tests
-  
-  # Using FCI (More accurate than RFCI)
-  fci_full <- fci(suffStat_full, indepTest = gaussCItest, alpha = alpha_val, 
-                  labels = node_names, verbose = FALSE)
-  adj_full <- fci_full@amat
-  
-  # Determine Targets
-  if (!is.null(fixed_targets)) {
-    print(paste("Using", length(fixed_targets), "pre-defined targets."))
-    final_targets <- fixed_targets
+
+  # 2. File Name Setup
+
+  clean_cause <- gsub("[^[:alnum:]]", "_", cause_var)
+
+  if (is.null(file_name)) {
+
+    csv_name <- paste0("Downstream_Effects_", clean_cause, ".csv")
+
   } else {
-    print("Discovering top targets...")
-    all_others_idx <- setdiff(1:length(node_names), driver_idx)
-    temp_effects <- numeric(length(all_others_idx))
-    names(temp_effects) <- node_names[all_others_idx]
-    
-    for (i in seq_along(all_others_idx)) {
-      t_idx <- all_others_idx[i]
-      temp_effects[i] <- get_lv_ida_est(adj_full, cov_full, driver_idx, t_idx)
-    }
-    
-    sorted <- sort(abs(temp_effects), decreasing = TRUE)
-    final_targets <- names(sorted)[1:n_top_targets]
-    print(paste("Top targets discovered:", paste(final_targets, collapse=", ")))
+
+    csv_name <- ifelse(grepl("\\.csv$", file_name), file_name, paste0(file_name, ".csv"))
+
   }
+
   
-  # Get Point Estimates for the Final Targets
-  point_estimates <- numeric(length(final_targets))
-  names(point_estimates) <- final_targets
-  for (targ in final_targets) {
-    t_idx <- which(node_names == targ)
-    point_estimates[targ] <- get_lv_ida_est(adj_full, cov_full, driver_idx, t_idx)
-  }
+
+  dir_path <- dirname(csv_name)
+
+  if (dir_path != "." && !dir.exists(dir_path)) dir.create(dir_path, recursive = TRUE)
+
   
-  # ============================================================================
-  # PHASE 2: ROBUST BOOTSTRAP (With Cycle Checks)
-  # ============================================================================
-  print(paste("--- PHASE 2: Bootstrapping", n_boots, "iterations ---"))
-  
-  boot_effects <- matrix(NA, nrow = n_boots, ncol = length(final_targets))
-  colnames(boot_effects) <- final_targets
-  
-  skipped_count <- 0
-  
-  set.seed(123)
-  for (i in 1:n_boots) {
-    if (i %% 10 == 0) print(paste("Iteration:", i))
+
+  # 3. Main Loop
+
+  for (alpha in alphas) {
+
+    message(paste("\n=== Processing Alpha =", alpha, "==="))
+
     
-    # 1. Resample
-    indices <- sample(1:n_obs, replace = TRUE)
-    d_boot  <- data[indices, ]
-    cov_boot <- cov(d_boot)
-    suffStat_boot <- list(C = cor(d_boot), n = n_obs)
+
+    boot_min_effects <- matrix(NA, nrow = n_targets, ncol = n_boots)
+
+    boot_max_effects <- matrix(NA, nrow = n_targets, ncol = n_boots)
+
     
-    # 2. Structure Learning (FCI)
-    # Wrap in tryCatch to prevent crashing on singular matrices
-    fci_boot <- tryCatch({
-      fci(suffStat_boot, indepTest = gaussCItest, alpha = alpha_val, 
-          labels = node_names, verbose = FALSE)
-    }, error = function(e) return(NULL))
+
+    skipped_count <- 0
+
     
-    if (is.null(fci_boot)) {
-      skipped_count <- skipped_count + 1
-      next
-    }
+
+    for (b in 1:n_boots) {
+
+      if (b %% 10 == 0) message(paste("   Bootstrap", b, "/", n_boots))
+
+      
+
+      # Resample
+
+      boot_indices <- sample(1:n_obs, n_obs, replace = TRUE)
+
+      boot_data <- data[boot_indices, ]
+
+      
+
+      # Stats
+
+      suffStat <- list(C = cor(boot_data, use = "pairwise.complete.obs"), n = n_obs)
+
+      mcov <- cov(boot_data, use = "pairwise.complete.obs")
+
+      
+
+      # Run RFCI
+
+      pag.est <- tryCatch({
+
+        fci(suffStat, indepTest = gaussCItest, alpha = alpha, 
+
+            labels = colnames(data), verbose = FALSE, m.max = 4)
+
+      }, error = function(e) return(NULL))
+
+      
+
+      if (is.null(pag.est)) {
+
+        skipped_count <- skipped_count + 1
+
+        next
+
+      }
+
+      
+
+      amat <- pag.est@amat
+
+      
+
+      # --- CRITICAL FIX: CHECK FOR CYCLES ---
+
+      # If the graph has a cycle, lv.ida will crash with Stack Overflow.
+
+      # We must skip this iteration.
+
+      if (exists("is.cyclic") && is.cyclic(amat)) {
+
+        # message("Skipping cyclic graph...") # Optional: uncomment to see how often this happens
+
+        skipped_count <- skipped_count + 1
+
+        next
+
+      }
+
+      
+
+      # Check Targets
+
+      for (i in seq_along(potential_targets)) {
+
+        target_name <- potential_targets[i]
+
+        target_idx <- which(colnames(data) == target_name)
+
+        
+
+        # Optimization
+
+        is_possible_descendant <- target_idx %in% pcalg::possibleDe(amat, cause_idx)
+
+        
+
+        if (!is_possible_descendant) {
+
+          boot_min_effects[i, b] <- 0
+
+          boot_max_effects[i, b] <- 0
+
+        } else {
+
+          # Run LV-IDA
+
+          # Note: Checking if function is 'lv.ida' (dot) or 'lvida' (no dot) based on your source file
+
+          effs <- tryCatch({
+
+            if (exists("lv.ida")) {
+
+              lv.ida(cause_idx, target_idx, mcov, amat, method = "local")
+
+            } else {
+
+              lvida(cause_idx, target_idx, mcov, amat) 
+
+            }
+
+          }, error = function(e) return(NA))
+
+          
+
+          if (!all(is.na(effs))) {
+
+            boot_min_effects[i, b] <- min(abs(effs))
+
+            boot_max_effects[i, b] <- max(abs(effs))
+
+          } else {
+
+            boot_min_effects[i, b] <- 0
+
+            boot_max_effects[i, b] <- 0
+
+          }
+
+        }
+
+      }
+
+    } 
+
     
-    amat_boot <- fci_boot@amat
+
+    message(paste("   Skipped", skipped_count, "cyclic/failed graphs out of", n_boots))
+
     
-    # 3. SAFETY CHECK: Cycles
-    # If the graph is cyclic, LV-IDA will crash/hang. Skip this iteration.
-    if (exists("is.cyclic") && is.cyclic(amat_boot)) {
-      skipped_count <- skipped_count + 1
-      next 
-    }
+
+    # 4. Summarize
+
+    alpha_summary <- data.frame(
+
+      Target_Gene = potential_targets,
+
+      Alpha = alpha,
+
+      Stability_Pct = rowMeans(boot_max_effects > 0, na.rm = TRUE) * 100,
+
+      Median_Min_Effect = apply(boot_min_effects, 1, function(x) median(x[x > 0], na.rm = TRUE)),
+
+      Median_Max_Effect = apply(boot_max_effects, 1, function(x) median(x[x > 0], na.rm = TRUE))
+
+    )
+
     
-    # 4. Calculate Effects
-    for (targ in final_targets) {
-      t_idx <- which(node_names == targ)
-      boot_effects[i, targ] <- get_lv_ida_est(amat_boot, cov_boot, driver_idx, t_idx)
-    }
-  }
+
+    alpha_summary[is.na(alpha_summary)] <- 0
+
+    final_summary <- rbind(final_summary, alpha_summary)
+
+  } 
+
   
-  if (skipped_count > 0) {
-    print(paste("Warning: Skipped", skipped_count, "bootstraps due to cycles or errors."))
-  }
-  
-  # ============================================================================
-  # OUTPUTS
-  # ============================================================================
-  write.csv(boot_effects, paste0("LV_IDA_Raw_", group_name, ".csv"), row.names = FALSE)
-  
-  summary_df <- data.frame(
-    Target = final_targets,
-    Point_Estimate = point_estimates,
-    # Calculate stats ignoring NAs (skipped loops result in NAs)
-    Boot_Mean = apply(boot_effects, 2, mean, na.rm=TRUE),
-    Lower_CI  = apply(boot_effects, 2, quantile, probs=0.025, na.rm=TRUE),
-    Upper_CI  = apply(boot_effects, 2, quantile, probs=0.975, na.rm=TRUE),
-    Stability_Pct = apply(boot_effects, 2, function(x) mean(x != 0, na.rm=TRUE) * 100)
-  )
-  write.csv(summary_df, paste0("LV_IDA_Summary_", group_name, ".csv"), row.names = FALSE)
-  
-  return(list(
-    targets = final_targets,
-    adj_matrix = adj_full,
-    summary = summary_df
-  ))
+
+  write.csv(final_summary, csv_name, row.names = FALSE)
+
+  message(paste("Saved downstream effects summary to:", csv_name))
+
+  return(final_summary)
+
 }
+
+
+
+# Run
+
+results_full <- estimate_downstream_effects_safe(X_filtered_stable, "MAP3K5-AS2", n_boots = 500, file_name = "Full_MAP3K5_AS2.csv")
+
+
 ```
 
 
@@ -575,12 +685,12 @@ get_local_graph <- function(data, nodes_of_interest, alpha = 0.05) {
   suffStat <- list(C = cor(dat_mat), n = n)
   
   # Fit PC algorithm
-  pc_fit <- pc(suffStat, indepTest = gaussCItest, alpha = alpha, 
+  fci_fit <- fci(suffStat, indepTest = gaussCItest, alpha = alpha, 
                labels = colnames(dat_mat), verbose = FALSE)
   
   # 2. Convert to igraph object to extract subgraph
   # pcalg returns a graphNEL object, we convert to adjacency matrix first
-  adj_mat <- as(pc_fit@graph, "matrix")
+  adj_mat <- as(fci_fit@graph, "matrix")
   
   # Subset the adjacency matrix to ONLY our nodes of interest
   # (Check if all nodes exist in the data first to avoid errors)
