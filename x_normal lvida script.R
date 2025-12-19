@@ -1,265 +1,158 @@
 library(tidyverse)
-
 library(glmnet)
-
 library(pcalg)
-
-library(foreach)
-
-library(doParallel)
-
 library(reshape2)
+library(graph)
 
-library(graph) 
+# --- Setup ---
+if(!file.exists("lv-ida/lvida.R")) stop("lv-ida/lvida.R not found.")
+source("lv-ida/lvida.R")
+if(file.exists("lv-ida/iscyclic.R")) source("lv-ida/iscyclic.R")
 
-X_normal_stable <- read_csv("data/X_normal_stable.csv")
+X_asthma_stable <- read_csv("data/X_asthma_stable.csv", show_col_types = FALSE)
+X_asthma_stable <- X_asthma_stable[, -1]
 
-source("lv-ida/lvida.R") 
-
-source("lv-ida/iscyclic.R")
-
-X_asthma_stable <- read_csv("data/X_asthma_stable.csv")
-
-estimate_downstream_effects_safe <- function(data, cause_var, n_boots = 500, file_name = NULL) {
+# --- CORE FUNCTION (SERIAL) ---
+estimate_downstream_effects_serial <- function(data, cause_var, n_boots = 100, file_name = NULL) {
   
-  
-  
-  # 1. Setup
-  
-  alphas <- c(0.05)
-  
-  cause_idx <- which(colnames(data) == cause_var)
-  
-  
+  # 1. Setup and Pre-indexing
+  alpha_val <- 0.01  
+  node_names <- colnames(data)
+  cause_idx <- which(node_names == cause_var)
   
   if (length(cause_idx) == 0) stop("Cause variable not found in data.")
   
-  
-  
-  potential_targets <- colnames(data)[-cause_idx]
-  
-  n_targets <- length(potential_targets)
-  
+  potential_targets <- node_names[-cause_idx]
+  target_indices <- setdiff(seq_along(node_names), cause_idx)
+  n_targets <- length(target_indices)
   n_obs <- nrow(data)
   
-  
-  
-  final_summary <- data.frame()
-  
-  
-  
   # 2. File Name Setup
-  
   clean_cause <- gsub("[^[:alnum:]]", "_", cause_var)
+  csv_name <- if(is.null(file_name)) paste0("Causal_Stability_", clean_cause, ".csv") else file_name
   
-  if (is.null(file_name)) {
+  message(paste("Processing", n_boots, "bootstraps serially..."))
+  
+  # 3. Serial Bootstrap Loop
+  boot_results <- vector("list", n_boots)
+  pb <- txtProgressBar(min = 0, max = n_boots, style = 3)
+  
+  for (b in 1:n_boots) {
     
-    csv_name <- paste0("Downstream_Effects_", clean_cause, ".csv")
+    # Resample Data
+    boot_indices <- sample.int(n_obs, n_obs, replace = TRUE)
+    boot_data <- data[boot_indices, ]
+    suffStat <- list(C = cor(boot_data, use = "pairwise.complete.obs"), n = n_obs)
+    mcov <- cov(boot_data, use = "pairwise.complete.obs")
     
-  } else {
+    # Estimate PAG via RFCI
+    pag_est <- tryCatch({
+      rfci(suffStat, indepTest = gaussCItest, alpha = alpha_val, 
+           labels = node_names, verbose = FALSE, m.max = 4)
+    }, error = function(e) {
+      message(paste("\nBootstrap", b, "failed at RFCI"))
+      return(NULL)
+    })
     
-    csv_name <- ifelse(grepl("\\.csv$", file_name), file_name, paste0(file_name, ".csv"))
+    if (is.null(pag_est)) {
+      boot_results[[b]] <- NULL
+      setTxtProgressBar(pb, b)
+      next
+    }
     
+    amat <- pag_est@amat
+    
+    # Proper cycle checking with tryCatch
+    is_cyclic <- tryCatch({
+      if (exists("is.cyclic", mode = "function")) {
+        is.cyclic(amat)
+      } else {
+        FALSE  # If function doesn't exist, proceed without check
+      }
+    }, error = function(e) {
+      FALSE  # If error occurs, proceed without check
+    })
+    
+    if (is_cyclic) {
+      message(paste("\nBootstrap", b, "skipped - cyclic graph detected"))
+      boot_results[[b]] <- NULL
+      setTxtProgressBar(pb, b)
+      next
+    }
+    
+    # Calculate Causal Effects
+    row_eff <- numeric(n_targets)
+    descendants <- pcalg::possibleDe(amat, cause_idx)
+    
+    # Optimization: Only check nodes reachable from the cause
+    active_targets <- intersect(target_indices, descendants)
+    
+    if (length(active_targets) > 0) {
+      for (target_idx in active_targets) {
+        # Positional mapping in the output vector (1 to n_targets)
+        out_pos <- if(target_idx < cause_idx) target_idx else target_idx - 1
+        
+        effs <- tryCatch({
+          if (exists("lv.ida", mode = "function")) {
+            lv.ida(cause_idx, target_idx, mcov, amat, method = "local")
+          } else {
+            lvida(cause_idx, target_idx, mcov, amat)
+          }
+        }, error = function(e) {
+          message(paste("\nBootstrap", b, "- Effect calculation failed for target", target_idx))
+          return(NA)
+        })
+        
+        # Take the MEDIAN of the multiset for this specific bootstrap
+        if (!all(is.na(effs)) && length(effs) > 0) {
+          row_eff[out_pos] <- median(effs, na.rm = TRUE)
+        }
+      }
+    }
+    
+    boot_results[[b]] <- row_eff
+    setTxtProgressBar(pb, b)
   }
   
+  close(pb)
   
+  # 4. Result Aggregation and CI Calculation
+  # Filter out failed bootstraps
+  valid_results <- boot_results[!sapply(boot_results, is.null)]
+  n_valid <- length(valid_results)
+  message(paste("\nSuccessful Bootstraps:", n_valid, "/", n_boots))
   
-  dir_path <- dirname(csv_name)
+  if (n_valid < 10) stop("Insufficient successful bootstraps for statistics.")
   
-  if (dir_path != "." && !dir.exists(dir_path)) dir.create(dir_path, recursive = TRUE)
+  # Create effect matrix [genes x bootstraps]
+  eff_matrix <- do.call(cbind, valid_results)
   
+  # Helper to compute stats for each gene across bootstraps
+  # Only considers instances where a causal path was found (non-zero)
+  compute_stats <- function(row) {
+    causal_vals <- row[row != 0]
+    if (length(causal_vals) == 0) return(c(0, 0, 0))
+    
+    c(median(causal_vals), 
+      quantile(causal_vals, 0.025), 
+      quantile(causal_vals, 0.975))
+  }
   
+  stats_data <- t(apply(eff_matrix, 1, compute_stats))
   
-  # 3. Main Loop
+  final_summary <- data.frame(
+    Target_Gene   = potential_targets,
+    Alpha         = alpha_val,
+    Stability_Pct = (rowSums(eff_matrix != 0) / n_valid) * 100,
+    Median_Effect = stats_data[, 1],
+    CI_Lower      = stats_data[, 2],
+    CI_Upper      = stats_data[, 3]
+  )
   
-  for (alpha in alphas) {
-    
-    message(paste("\n=== Processing Alpha =", alpha, "==="))
-    
-    
-    
-    boot_min_effects <- matrix(NA, nrow = n_targets, ncol = n_boots)
-    
-    boot_max_effects <- matrix(NA, nrow = n_targets, ncol = n_boots)
-    
-    
-    
-    skipped_count <- 0
-    
-    
-    
-    for (b in 1:n_boots) {
-      
-      if (b %% 10 == 0) message(paste("   Bootstrap", b, "/", n_boots))
-      
-      
-      
-      # Resample
-      
-      boot_indices <- sample(1:n_obs, n_obs, replace = TRUE)
-      
-      boot_data <- data[boot_indices, ]
-      
-      
-      
-      # Stats
-      
-      suffStat <- list(C = cor(boot_data, use = "pairwise.complete.obs"), n = n_obs)
-      
-      mcov <- cov(boot_data, use = "pairwise.complete.obs")
-      
-      
-      
-      # Run RFCI
-      
-      pag.est <- tryCatch({
-        
-        fci(suffStat, indepTest = gaussCItest, alpha = alpha, 
-            
-            labels = colnames(data), verbose = FALSE, m.max = 4)
-        
-      }, error = function(e) return(NULL))
-      
-      
-      
-      if (is.null(pag.est)) {
-        
-        skipped_count <- skipped_count + 1
-        
-        next
-        
-      }
-      
-      
-      
-      amat <- pag.est@amat
-      
-      
-      
-      # --- CRITICAL FIX: CHECK FOR CYCLES ---
-      
-      # If the graph has a cycle, lv.ida will crash with Stack Overflow.
-      
-      # We must skip this iteration.
-      
-      if (exists("is.cyclic") && is.cyclic(amat)) {
-        
-        # message("Skipping cyclic graph...") # Optional: uncomment to see how often this happens
-        
-        skipped_count <- skipped_count + 1
-        
-        next
-        
-      }
-      
-      
-      
-      # Check Targets
-      
-      for (i in seq_along(potential_targets)) {
-        
-        target_name <- potential_targets[i]
-        
-        target_idx <- which(colnames(data) == target_name)
-        
-        
-        
-        # Optimization
-        
-        is_possible_descendant <- target_idx %in% pcalg::possibleDe(amat, cause_idx)
-        
-        
-        
-        if (!is_possible_descendant) {
-          
-          boot_min_effects[i, b] <- 0
-          
-          boot_max_effects[i, b] <- 0
-          
-        } else {
-          
-          # Run LV-IDA
-          
-          # Note: Checking if function is 'lv.ida' (dot) or 'lvida' (no dot) based on your source file
-          
-          effs <- tryCatch({
-            
-            if (exists("lv.ida")) {
-              
-              lv.ida(cause_idx, target_idx, mcov, amat, method = "local")
-              
-            } else {
-              
-              lvida(cause_idx, target_idx, mcov, amat) 
-              
-            }
-            
-          }, error = function(e) return(NA))
-          
-          
-          
-          if (!all(is.na(effs))) {
-            
-            boot_min_effects[i, b] <- min(abs(effs))
-            
-            boot_max_effects[i, b] <- max(abs(effs))
-            
-          } else {
-            
-            boot_min_effects[i, b] <- 0
-            
-            boot_max_effects[i, b] <- 0
-            
-          }
-          
-        }
-        
-      }
-      
-    } 
-    
-    
-    
-    message(paste("   Skipped", skipped_count, "cyclic/failed graphs out of", n_boots))
-    
-    
-    
-    # 4. Summarize
-    
-    alpha_summary <- data.frame(
-      
-      Target_Gene = potential_targets,
-      
-      Alpha = alpha,
-      
-      Stability_Pct = rowMeans(boot_max_effects > 0, na.rm = TRUE) * 100,
-      
-      Median_Min_Effect = apply(boot_min_effects, 1, function(x) median(x[x > 0], na.rm = TRUE)),
-      
-      Median_Max_Effect = apply(boot_max_effects, 1, function(x) median(x[x > 0], na.rm = TRUE))
-      
-    )
-    
-    
-    
-    alpha_summary[is.na(alpha_summary)] <- 0
-    
-    final_summary <- rbind(final_summary, alpha_summary)
-    
-  } 
-  
-  
-  
+  # Save and Return
   write.csv(final_summary, csv_name, row.names = FALSE)
-  
-  message(paste("Saved downstream effects summary to:", csv_name))
-  
   return(final_summary)
-  
 }
 
-
-
-# Run
-
-results_normal<- estimate_downstream_effects_safe(X_normal_stable, "MAP3K5-AS2", n_boots = 500, file_name = "Normal_MAP3K5_AS2.csv")
+# --- EXAMPLE USAGE ---
+results_asthma <- estimate_downstream_effects_serial(X_asthma_stable, "MAP3K5-AS2", n_boots = 100, "asthma lvida.csv")

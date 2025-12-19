@@ -16,7 +16,7 @@ library(stats)
 library(boot)
 ```
 
-## Load clean datasets
+# Load the clean data 
 
 ```{r}
 X_filtered <- read_csv("data/X_filtered.csv")
@@ -29,19 +29,14 @@ X_normal <- read_csv("data/X_normal.csv")
 X_normal <- as.data.frame(X_normal)
 ```
 
-Run Lasso for the "MAP3K5−AS2" neighborhood and Compare lamda options for optimal selection
+Run Lasso for the MAP3K5−AS2 neighborhood and compare lambda seq results against lambda.1se to make a tractable network of the top 25 most stable genes
 
 ```{r}
-# 1. Setup Data: Target MAP3K5−AS2
-# Yes, this correctly targets MAP3K5−AS2. By setting y = MAP3K5−AS2, you are asking
-# the Lasso to find which other genes (x) are most predictive of MAP3K5−AS2.
+# Setup 
 y <- as.numeric(X_filtered[, "MAP3K5-AS2"])
 x <- as.matrix(X_filtered[, setdiff(colnames(X_filtered), "MAP3K5-AS2")])
 
-# 2. Generate a fixed Lambda Sequence
-# We MUST do this once on the full data so every bootstrap iteration 
-# uses the exact same grid. Otherwise, the matrices won't match up.
-full_fit <- glmnet(x, y, alpha = 1) 
+full_fit <- glmnet(x, y, alpha = 1) # Alpha = 1
 lambda_seq <- full_fit$lambda 
 
 n_stab_boot <- 10000 
@@ -49,44 +44,37 @@ n_cores <- detectCores() - 1
 cl <- makeCluster(n_cores)
 registerDoParallel(cl)
 
-# 3. Subsampling function (Alpha fixed to 1)
+# Subsampling helper 
 run_lasso_sub <- function(x, y, lambdas) {
-  # Subsample 50% without replacement
-  sub_idx <- sample(1:nrow(x), floor(nrow(x))/2, replace = FALSE)
-  
-  # Run glmnet with the FIXED lambda sequence and alpha = 1
+  sub_idx <- sample(1:nrow(x), floor(nrow(x))/2, replace = FALSE) # Use n/2 subsamples with no replacement for stability test
   fit <- glmnet(x[sub_idx,], y[sub_idx], alpha = 1, lambda = lambdas)
-  
-  # Return binary matrix (1 if selected, 0 if not)
   coefs <- coef(fit, s = lambdas)
   return(as.matrix(coefs[-1, ] != 0) * 1) 
 }
 
-# Export standard lambda_seq to cluster
+# Export lambda_seq to cluster
 clusterExport(cl, c("x", "y", "lambda_seq", "run_lasso_sub"))
 clusterEvalQ(cl, library(glmnet))
 
-# 4. Bootstrap
-message(paste("Running", n_stab_boot, "stability bootstraps..."))
+# Bootstrap
+message(paste("Running", n_stab_boot, "bootstrap..."))
 stab_list <- foreach(i = 1:n_stab_boot) %dopar% {
   run_lasso_sub(x, y, lambda_seq)
 }
 stopCluster(cl)
 
-# 5. Stability probabilities
+# Find stability probabilities 
 prob_matrix <- Reduce("+", stab_list) / n_stab_boot
 colnames(prob_matrix) <- paste0("L", 1:length(lambda_seq))
 
-# Optimal lambda
+# Find the optimal lambda
 cv_check <- cv.glmnet(x, y, alpha = 1, lambda = lambda_seq)
 target_lambda_idx <- which(lambda_seq == cv_check$lambda.1se)
 
-# If exact match fails due to float precision, use nearest index:
+# Nearest index at the target lambda if exact match fails
 if(length(target_lambda_idx) == 0) {
     target_lambda_idx <- which.min(abs(lambda_seq - cv_check$lambda.1se))
 }
-
-# Stability scores at that Lambda
 gene_stability_scores <- prob_matrix[, target_lambda_idx]
 
 # Create and sort df
@@ -95,16 +83,11 @@ stability_df <- data.frame(
   Stability_Prob = as.numeric(gene_stability_scores)
 )
 
-# Sort descending
 stability_df <- stability_df[order(-stability_df$Stability_Prob), ]
 
 # Top 25 genes
 top_genes <- head(stability_df$Gene, 25)
-
-# Include MAP3K5-AS2at the top of the list
 final_genes <- unique(c("MAP3K5-AS2", top_genes))
-
-# Keep top 25 (Including MAP3K5-AS2)
 if(length(final_genes) > 25) {
   final_genes <- final_genes[1:25]
 }
@@ -117,10 +100,10 @@ X_normal_stable <- X_normal[, final_genes]
 write.csv(X_normal_stable, "data/X_normal_stable.csv")
 
 X_filtered_stable <- X_filtered[, final_genes]
-write.csv(X_filtered_stable, "data/X_normal_stable.csv")
+write.csv(X_filtered_stable, "data/X_filtered_stable.csv")
 ```
 
-Plot PAGs with FCI
+Plot PAGs of top 25 genes with FCI
 
 ```{r}
 analyze_pag_sensitivity_fci <- function(data, title = NULL, file_name = NULL) {
@@ -148,7 +131,7 @@ analyze_pag_sensitivity_fci <- function(data, title = NULL, file_name = NULL) {
   
   for (alpha in alphas) {
     
-    message(paste("Running FCI for Alpha:", alpha, "..."))
+    message(paste("FCI on Alpha:", alpha, "..."))
     
     # system.time
     pag.est <- NULL
@@ -217,7 +200,7 @@ plot(results_filtered$Alpha, results_filtered$Time_Sec,
      xlab = "Alpha", ylab = "Time (seconds)")
 ```
 
-Plot PAGs with RFCI
+Plot PAGs of top 25 genes with RFCI
 
 ```{r}
 analyze_pag_sensitivity_rfci <- function(data, title = NULL, file_name = NULL) {
@@ -245,7 +228,7 @@ analyze_pag_sensitivity_rfci <- function(data, title = NULL, file_name = NULL) {
   
   for (alpha in alphas) {
     
-    message(paste("Running FCI for Alpha:", alpha, "..."))
+    message(paste("RFCI on Alpha:", alpha, "..."))
     
     # system.time
     pag.est <- NULL
@@ -267,7 +250,7 @@ analyze_pag_sensitivity_rfci <- function(data, title = NULL, file_name = NULL) {
                                                  Edge_Count = current_edges, 
                                                  Time_Sec = as.numeric(duration)))
     
-    # Plot PAG
+    # Plot
     plot(pag.est)
     
     # Title
@@ -284,6 +267,8 @@ analyze_pag_sensitivity_rfci <- function(data, title = NULL, file_name = NULL) {
   return(results_df)
 }
 
+# Save
+
 results_asthma <- analyze_pag_sensitivity_rfci(X_asthma_stable,
                                           file_name = "rfci_Asthma_PAG_Analysis.pdf")
 
@@ -297,7 +282,7 @@ print(results_asthma)
 print(results_normal)
 print(results_filtered)
 
-# Visualize runtime
+# Runtime plot
 plot(results_asthma$Alpha, results_asthma$Time_Sec, 
      type = "b", pch = 19, col = "red",
      main = "Computation Time by Alpha",
@@ -314,437 +299,182 @@ plot(results_filtered$Alpha, results_filtered$Time_Sec,
      xlab = "Alpha", ylab = "Time (seconds)")
 ```
 
-Go with alpha = 0.05, use LV-IDA and RFCI to see the causal effect of MAP3K5-AS2 on other genes in the full dataset to idendify targets (to make a CI for the stratified datasets and also calculate edge type percentage across bootstraps). Make a function
+Compare the edge counts
 
 ```{r}
-library(pcalg)
-library(dplyr)
-library(boot)
-library(foreach)
-library(doParallel)
-
-library(tidyverse)
-
-library(glmnet)
-
-library(pcalg)
-
-library(foreach)
-
-library(doParallel)
-
-library(reshape2)
-
-library(graph) 
-
-source("lv-ida/lvida.R") 
-
-source("lv-ida/iscyclic.R")
-
-
-
-estimate_downstream_effects_safe <- function(data, cause_var, n_boots = 500, file_name = NULL) {
-
-  
-
-  # 1. Setup
-
-  alphas <- c(0.05)
-
-  cause_idx <- which(colnames(data) == cause_var)
-
-  
-
-  if (length(cause_idx) == 0) stop("Cause variable not found in data.")
-
-  
-
-  potential_targets <- colnames(data)[-cause_idx]
-
-  n_targets <- length(potential_targets)
-
-  n_obs <- nrow(data)
-
-  
-
-  final_summary <- data.frame()
-
-  
-
-  # 2. File Name Setup
-
-  clean_cause <- gsub("[^[:alnum:]]", "_", cause_var)
-
-  if (is.null(file_name)) {
-
-    csv_name <- paste0("Downstream_Effects_", clean_cause, ".csv")
-
-  } else {
-
-    csv_name <- ifelse(grepl("\\.csv$", file_name), file_name, paste0(file_name, ".csv"))
-
-  }
-
-  
-
-  dir_path <- dirname(csv_name)
-
-  if (dir_path != "." && !dir.exists(dir_path)) dir.create(dir_path, recursive = TRUE)
-
-  
-
-  # 3. Main Loop
-
-  for (alpha in alphas) {
-
-    message(paste("\n=== Processing Alpha =", alpha, "==="))
-
-    
-
-    boot_min_effects <- matrix(NA, nrow = n_targets, ncol = n_boots)
-
-    boot_max_effects <- matrix(NA, nrow = n_targets, ncol = n_boots)
-
-    
-
-    skipped_count <- 0
-
-    
-
-    for (b in 1:n_boots) {
-
-      if (b %% 10 == 0) message(paste("   Bootstrap", b, "/", n_boots))
-
-      
-
-      # Resample
-
-      boot_indices <- sample(1:n_obs, n_obs, replace = TRUE)
-
-      boot_data <- data[boot_indices, ]
-
-      
-
-      # Stats
-
-      suffStat <- list(C = cor(boot_data, use = "pairwise.complete.obs"), n = n_obs)
-
-      mcov <- cov(boot_data, use = "pairwise.complete.obs")
-
-      
-
-      # Run RFCI
-
-      pag.est <- tryCatch({
-
-        fci(suffStat, indepTest = gaussCItest, alpha = alpha, 
-
-            labels = colnames(data), verbose = FALSE, m.max = 4)
-
-      }, error = function(e) return(NULL))
-
-      
-
-      if (is.null(pag.est)) {
-
-        skipped_count <- skipped_count + 1
-
-        next
-
-      }
-
-      
-
-      amat <- pag.est@amat
-
-      
-
-      # --- CRITICAL FIX: CHECK FOR CYCLES ---
-
-      # If the graph has a cycle, lv.ida will crash with Stack Overflow.
-
-      # We must skip this iteration.
-
-      if (exists("is.cyclic") && is.cyclic(amat)) {
-
-        # message("Skipping cyclic graph...") # Optional: uncomment to see how often this happens
-
-        skipped_count <- skipped_count + 1
-
-        next
-
-      }
-
-      
-
-      # Check Targets
-
-      for (i in seq_along(potential_targets)) {
-
-        target_name <- potential_targets[i]
-
-        target_idx <- which(colnames(data) == target_name)
-
-        
-
-        # Optimization
-
-        is_possible_descendant <- target_idx %in% pcalg::possibleDe(amat, cause_idx)
-
-        
-
-        if (!is_possible_descendant) {
-
-          boot_min_effects[i, b] <- 0
-
-          boot_max_effects[i, b] <- 0
-
-        } else {
-
-          # Run LV-IDA
-
-          # Note: Checking if function is 'lv.ida' (dot) or 'lvida' (no dot) based on your source file
-
-          effs <- tryCatch({
-
-            if (exists("lv.ida")) {
-
-              lv.ida(cause_idx, target_idx, mcov, amat, method = "local")
-
-            } else {
-
-              lvida(cause_idx, target_idx, mcov, amat) 
-
-            }
-
-          }, error = function(e) return(NA))
-
-          
-
-          if (!all(is.na(effs))) {
-
-            boot_min_effects[i, b] <- min(abs(effs))
-
-            boot_max_effects[i, b] <- max(abs(effs))
-
-          } else {
-
-            boot_min_effects[i, b] <- 0
-
-            boot_max_effects[i, b] <- 0
-
-          }
-
-        }
-
-      }
-
-    } 
-
-    
-
-    message(paste("   Skipped", skipped_count, "cyclic/failed graphs out of", n_boots))
-
-    
-
-    # 4. Summarize
-
-    alpha_summary <- data.frame(
-
-      Target_Gene = potential_targets,
-
-      Alpha = alpha,
-
-      Stability_Pct = rowMeans(boot_max_effects > 0, na.rm = TRUE) * 100,
-
-      Median_Min_Effect = apply(boot_min_effects, 1, function(x) median(x[x > 0], na.rm = TRUE)),
-
-      Median_Max_Effect = apply(boot_max_effects, 1, function(x) median(x[x > 0], na.rm = TRUE))
-
-    )
-
-    
-
-    alpha_summary[is.na(alpha_summary)] <- 0
-
-    final_summary <- rbind(final_summary, alpha_summary)
-
-  } 
-
-  
-
-  write.csv(final_summary, csv_name, row.names = FALSE)
-
-  message(paste("Saved downstream effects summary to:", csv_name))
-
-  return(final_summary)
-
+sparsity_data <- data.frame(
+  Alpha = rep(c(0.01, 0.05, 0.10), 6),
+  Edges = c(33, 42, 51, 28, 37, 41, 21, 26, 32,  # RFCI: Overall, Asthma, Normal
+            20, 25, 28, 19, 24, 25, 17, 18, 16), # FCI: Overall, Asthma, Normal
+  Group = rep(c("Overall", "Asthma", "Normal", "Overall", "Asthma", "Normal"), each = 3),
+  Method = rep(c("RFCI", "FCI"), each = 9)
+)
+
+ggplot(sparsity_data, aes(x = Alpha, y = Edges, color = Group, linetype = Method)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "Network Sparsity vs. Alpha",
+       subtitle = "Comparison of RFCI and FCI across Study Groups",
+       x = "Significance Level (Alpha)",
+       y = "Number of Edges in PAG") +
+  scale_x_continuous(breaks = c(0.01, 0.05, 0.10))
+
+# Save
+ggsave("sparsity comparison.png")
+```
+
+Go with alpha = 0.01, use LV-IDA and RFCI to see the causal effect of MAP3K5-AS2 on other genes in the full dataset to idendify targets (capture median effect and its CI). Make a function for background scripting
+
+```{r}
+
+```
+
+Compare LV-IDA results between asthma and normal children with Welch's t-test
+
+```{r}
+asthma <- read.csv("Results/LV-IDA FX/asthma lvida.csv")
+normal <- read.csv("Results/LV-IDA FX/normal lvida.csv")
+
+# Format CI
+format_ci <- function(med, lower, upper) {
+  sprintf("%.3f (%.3f, %.3f)", med, lower, upper)
 }
 
+asthma <- asthma |>
+  mutate(Median_Effect_Asthma_Str = format_ci(Median_Effect, CI_Lower, CI_Upper))
 
+normal <- normal |>
+  mutate(Median_Effect_Normal_Str = format_ci(Median_Effect, CI_Lower, CI_Upper))
+
+# Merge
+merged_df <- inner_join(
+  asthma |> select(Target_Gene, Median_Effect, Median_Effect_Asthma_Str),
+  normal |> select(Target_Gene, Median_Effect, Median_Effect_Normal_Str),
+  by = "Target_Gene",
+  suffix = c("_Asthma", "_Normal")
+)
+
+# Welch's t-test
+t_test_result <- t.test(merged_df$Median_Effect_Asthma, 
+                        merged_df$Median_Effect_Normal, 
+                        var.equal = FALSE)
+
+p_val <- t_test_result$p.value
+
+merged_df$Global_P_Value <- sprintf("%.3f", p_val)
+
+# Table
+final_table <- merged_df |>
+  select(Target_Gene, Median_Effect_Asthma_Str, Median_Effect_Normal_Str, Global_P_Value) |>
+  rename(
+    Median_Effect_Asthma = Median_Effect_Asthma_Str,
+    Median_Effect_Normal = Median_Effect_Normal_Str
+  )
+
+print(head(final_table))
+write.csv(final_table, "asthma_normal_with_pvalue.csv", row.names = FALSE)
+```
+
+Try running IDA at alpha = 0.01 to get some results to compare to (turns out this doesn't work; there are no valid CPDAGs produced at each iteration)
+
+```{r}
+estimate_downstream_effects_ida_serial <- function(data, cause_var, n_boots = 100, file_name = NULL) {
+  
+  # Setup
+  alpha_val <- 0.01  
+  node_names <- colnames(data)
+  cause_idx <- which(node_names == cause_var)
+  
+  if (length(cause_idx) == 0) stop("Cause variable not found in data.")
+  
+  potential_targets <- node_names[-cause_idx]
+  target_indices <- setdiff(seq_along(node_names), cause_idx)
+  n_targets <- length(target_indices)
+  n_obs <- nrow(data)
+  
+  # Filenames
+  clean_cause <- gsub("[^[:alnum:]]", "_", cause_var)
+  csv_name <- if(is.null(file_name)) paste0("IDA_Stability_", clean_cause, ".csv") else file_name
+  
+  message(paste("Processing", n_boots, "bootstrap..."))
+  
+  # Boot loop
+  boot_results <- vector("list", n_boots)
+  pb <- txtProgressBar(min = 0, max = n_boots, style = 3)
+  
+  for (b in 1:n_boots) {
+    boot_indices <- sample.int(n_obs, n_obs, replace = TRUE)
+    boot_data <- data[boot_indices, ]
+    
+    # suffStat
+    suffStat <- list(C = cor(boot_data, use = "pairwise.complete.obs"), n = n_obs)
+    mcov <- cov(boot_data, use = "pairwise.complete.obs")
+    
+    # Use PC
+    pc_fit <- tryCatch({
+      pc(suffStat, indepTest = gaussCItest, alpha = alpha_val, 
+         labels = node_names, verbose = FALSE, solve.confl = TRUE)
+    }, error = function(e) {
+      return(NULL)
+    })
+    
+    if (is.null(pc_fit)) {
+      setTxtProgressBar(pb, b)
+      next
+    }
+
+    # Get effect
+    row_eff <- numeric(n_targets)
+    
+    for (i in seq_along(target_indices)) {
+      target_idx <- target_indices[i]
+      
+      effs <- tryCatch({
+        pcalg::ida(cause_idx, target_idx, mcov, pc_fit@graph, method = "local")
+      }, error = function(e) {
+        return(NA)
+      })
+      
+      # Use median to aggregate
+      if (!all(is.na(effs)) && length(effs) > 0) {
+        row_eff[i] <- median(effs, na.rm = TRUE)
+      }
+    }
+    
+    boot_results[[b]] <- row_eff
+    setTxtProgressBar(pb, b)
+  }
+  
+  close(pb)
+  
+  # Results aggregation
+  valid_results <- boot_results[!sapply(boot_results, is.null)]
+  n_valid <- length(valid_results)
+  message(paste("\nIDA Bootstraps:", n_valid, "/", n_boots))
+  
+  eff_matrix <- do.call(cbind, valid_results)
+  
+  compute_stats <- function(row) {
+    causal_vals <- row[row != 0]
+    if (length(causal_vals) == 0) return(c(0, 0, 0))
+    c(median(causal_vals), quantile(causal_vals, 0.025), quantile(causal_vals, 0.975))
+  }
+  
+  stats_data <- t(apply(eff_matrix, 1, compute_stats))
+  
+  final_summary <- data.frame(
+    Target_Gene   = potential_targets,
+    Stability_Pct = (rowSums(eff_matrix != 0) / n_valid) * 100,
+    Median_Effect = stats_data[, 1],
+    CI_Lower      = stats_data[, 2],
+    CI_Upper      = stats_data[, 3]
+  )
+  
+  write.csv(final_summary, csv_name, row.names = FALSE)
+  return(final_summary)
+}
 
 # Run
-
-results_full <- estimate_downstream_effects_safe(X_filtered_stable, "MAP3K5-AS2", n_boots = 500, file_name = "Full_MAP3K5_AS2.csv")
-
-
+asthma_results_ida <- estimate_downstream_effects_ida_serial(X_asthma_stable, "MAP3K5-AS2", n_boots = 100, "asthma_ida_results.csv")
 ```
-
-
-```{r}
-# ---------------------------------------------------------
-# STEP 1: Combined Dataset (Discovery)
-# ---------------------------------------------------------
-res_combined <- run_lv_ida_pipeline(
-  data = X_filtered_stable, 
-  group_name = "Combined", 
-  driver_node = "MAP3K5-AS2", 
-  n_top_targets = 10,
-  n_boots = 100 # Adjust as needed (100 is fast, 500 is publication standard)
-)
-
-universal_targets <- res_combined$targets
-print(paste("Universal Targets:", paste(universal_targets, collapse=", ")))
-
-# ---------------------------------------------------------
-# STEP 2: Stratified Datasets (Validation)
-# ---------------------------------------------------------
-res_normal <- run_lv_ida_pipeline(
-  data = X_normal_stable, 
-  group_name = "Normal", 
-  driver_node = "MAP3K5-AS2", 
-  fixed_targets = universal_targets,
-  n_boots = 100
-)
-
-res_asthma <- run_lv_ida_pipeline(
-  data = X_asthma_stable, 
-  group_name = "Asthma", 
-  driver_node = "MAP3K5-AS2", 
-  fixed_targets = universal_targets,
-  n_boots = 100
-)
-
-# ---------------------------------------------------------
-# STEP 3: SHD Comparison
-# ---------------------------------------------------------
-calc_shd <- function(amat1, amat2) { sum(amat1 != amat2) }
-
-shd_report <- data.frame(
-  Comparison = c("Normal vs Combined", "Asthma vs Combined", "Normal vs Asthma"),
-  SHD = c(
-    calc_shd(res_normal$adj_matrix, res_combined$adj_matrix),
-    calc_shd(res_asthma$adj_matrix, res_combined$adj_matrix),
-    calc_shd(res_normal$adj_matrix, res_asthma$adj_matrix)
-  )
-)
-
-print(shd_report)
-write.csv(shd_report, "SHD_Comparison_Report.csv", row.names = FALSE)
-```
-
-Next we examine the SHD compared to the combined dataset at alpha = 0.05
-
-```{r}
-# Load necessary libraries
-library(pcalg)
-library(igraph)
-library(dplyr)
-
-# ==============================================================================
-# SETUP: Define Inputs
-# ==============================================================================
-# 1. Define your gene of interest and top N targets
-driver_gene <- "MAP3K5-AS2"
-top_n <- 5
-
-# 2. Get the list of top targets from your PREVIOUS combined LV-IDA results
-# (Assuming 'lv_ida_summary' is your results dataframe from the previous step)
-# We filter for the driver gene and select top targets by absolute effect size
-top_targets <- lv_ida_summary %>%
-  filter(Parent == driver_gene) %>%
-  arrange(desc(abs(Min_Abs_Effect))) %>%
-  head(top_n) %>%
-  pull(Child)
-
-# Define the node set for the Local SHD (Driver + Top Targets)
-node_set_of_interest <- c(driver_gene, top_targets)
-
-print(paste("Calculating SHD for subgraph:", paste(node_set_of_interest, collapse=", ")))
-
-# ==============================================================================
-# HELPER FUNCTION: Learn Graph & Extract Subgraph
-# ==============================================================================
-get_local_graph <- function(data, nodes_of_interest, alpha = 0.05) {
-  
-  # 1. Standard PC Algorithm (or FCI if you prefer)
-  # Convert data to matrix and get correlation
-  dat_mat <- as.matrix(data)
-  n <- nrow(dat_mat)
-  p <- ncol(dat_mat)
-  suffStat <- list(C = cor(dat_mat), n = n)
-  
-  # Fit PC algorithm
-  fci_fit <- fci(suffStat, indepTest = gaussCItest, alpha = alpha, 
-               labels = colnames(dat_mat), verbose = FALSE)
-  
-  # 2. Convert to igraph object to extract subgraph
-  # pcalg returns a graphNEL object, we convert to adjacency matrix first
-  adj_mat <- as(fci_fit@graph, "matrix")
-  
-  # Subset the adjacency matrix to ONLY our nodes of interest
-  # (Check if all nodes exist in the data first to avoid errors)
-  valid_nodes <- nodes_of_interest[nodes_of_interest %in% colnames(adj_mat)]
-  sub_adj <- adj_mat[valid_nodes, valid_nodes]
-  
-  # Convert back to a graphNEL object for SHD calculation
-  # (pcalg::shd requires graphNEL or adjacency matrix)
-  return(as(sub_adj, "graphNEL"))
-}
-
-# ==============================================================================
-# EXECUTION: Calculate SHD
-# ==============================================================================
-
-# 1. Learn the Reference Graph (Combined Dataset)
-# Ensure X_filtered_stable is your numeric matrix/df of expression data
-ref_graph <- get_local_graph(X_filtered_stable, node_set_of_interest)
-
-# 2. Define your Strata (Example: Split by Median Age)
-# You need a vector 'stratification_var' that aligns with X_filtered_stable rows
-# For this example, I'll generate a dummy split. REPLACE THIS with your real clinical data.
-# Example: strata_list <- split(as.data.frame(X_filtered_stable), clinical_data$Age_Group)
-
-# Placeholder: Splitting randomly for demo purposes
-set.seed(123)
-random_split <- sample(c("Group_A", "Group_B"), nrow(X_filtered_stable), replace = TRUE)
-strata_list <- split(as.data.frame(X_filtered_stable), random_split)
-
-# 3. Loop through Strata and Compare to Combined
-results_shd <- data.frame(Stratum = character(), SHD = numeric(), stringsAsFactors = FALSE)
-
-for (stratum_name in names(strata_list)) {
-  
-  stratum_data <- strata_list[[stratum_name]]
-  
-  # Learn graph for this stratum
-  strat_graph <- get_local_graph(stratum_data, node_set_of_interest)
-  
-  # Calculate SHD between Stratum and Combined Reference
-  # Note: SHD counts edge insertions, deletions, and flips
-  dist <- pcalg::shd(ref_graph, strat_graph)
-  
-  results_shd <- rbind(results_shd, data.frame(Stratum = stratum_name, SHD = dist))
-}
-
-# ==============================================================================
-# OUTPUT
-# ==============================================================================
-print("Local Structural Hamming Distance (SHD) vs Combined Dataset:")
-print(results_shd)
-
-# Interpretation Hint:
-# Lower SHD = The causal mechanism for MAP3K5-AS2 is STABLE in this stratum.
-# Higher SHD = The mechanism in this stratum VARIES significantly from the population average.
-```
-

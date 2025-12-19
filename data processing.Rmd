@@ -64,7 +64,7 @@ Final check for data validity
 # 54,675 probes x 395 samples
 dim(expr)
 
-# Missing values (should be 0 or very small)
+# Missing values check
 sum(is.na(expr))
 
 # Distribution check (RMA-normalized log2 values)
@@ -89,7 +89,7 @@ top1000 <- names(sort(probe_vars, decreasing = TRUE))[1:1000]
 expr_1000 <- expr_qc[top1000, ]
 ```
 
-# Transpose + Scale
+Transpose + Scale
 
 ```{r}
 X_1000 <- t(expr_1000)
@@ -163,7 +163,7 @@ keep_condition <- (sex_qvals > 0.01) & (age_qvals > 0.01)
 genes_to_keep <- colnames(X_matched)[keep_condition]
 ```
 
-For microarray preprocessing, convert probe IDs to gene symbols, choose the highest variance probe for each gene assignment and avoid B cell confounding genes (IGH, IGK, and IGL). I only want protein encoding genes.
+For microarray preprocessing, convert probe IDs to gene symbols, choose the highest variance probe for each gene assignment and avoid B cell confounding genes (IGH, IGK, and IGL). I only want protein encoding genes
 
 ```{r}
 # map probes to symbols based on Entrez ID
@@ -204,7 +204,7 @@ write_csv(top_variance_probes, "data/top_probe_to_gene_mapping.csv")
 valid_probes <- top_variance_probes$PROBEID
 X_filtered <- X_matched[, valid_probes, drop = FALSE] 
 
-# Rename cols to symbols
+# Rename cols to symbols helper
 probe_to_gene <- setNames(
   top_variance_probes$SYMBOL,
   top_variance_probes$PROBEID
@@ -218,14 +218,13 @@ write_csv(as.data.frame(X_filtered), "data/X_filtered.csv")
 write_csv(data.frame(GENE = colnames(X_filtered)), "data/final_gene_list.csv")
 ```
 
-Separate the filtered dataset into asthmatics and non-asthmatics
+Stratify into asthmatics and non-asthmatics
 
 ```{r}
-# Identify subsamples
+# Subsamples
 asthma_idx <- which(disease_vec == "asthma")
 normal_idx <- which(disease_vec == "normal")
 
-# Subset
 X_asthma <- X_filtered[asthma_idx, ]
 X_normal <- X_filtered[normal_idx, ]
 
