@@ -14,6 +14,8 @@ library(reshape2)
 library(graph)
 library(stats)
 library(boot)
+library(doSNOW) 
+library(gt)
 ```
 
 # Load the clean data 
@@ -327,7 +329,140 @@ ggsave("sparsity comparison.png")
 Go with alpha = 0.01, use LV-IDA and RFCI to see the causal effect of MAP3K5-AS2 on other genes in the full dataset to idendify targets (capture median effect and its CI). Make a function for background scripting
 
 ```{r}
+# Loading LV-IDA files 
+source("lv-ida/lvida.R")
+source("lv-ida/iscyclic.R")
 
+# Main function
+estimate_downstream_effects_safe_parallel <- function(data, cause_var, n_boots = 100, file_name = NULL) {
+  
+  # Setup 
+  alpha_val <- 0.01  
+  node_names <- colnames(data) # Setting nodes
+  cause_idx <- which(node_names == cause_var) # Calling index of cause variable
+  
+  if (length(cause_idx) == 0) stop("Cause variable not found in data.") # Fail-safe for cause variable loading
+  
+  potential_targets <- node_names[-cause_idx] # Targets are everything but the cause var
+  target_indices <- setdiff(seq_along(node_names), cause_idx) 
+  n_targets <- length(target_indices) # Count number of target rows
+  n_obs <- nrow(data) # Count number of observations in dataset
+  csv_name <- if(is.null(file_name))
+  clean_cause <- gsub("[^[:alnum:]]", "_", cause_var) 
+
+  #setting up parallel cluster
+  n_cores <- parallel::detectCores() - 1 
+  cl <- makeCluster(n_cores) 
+  registerDoSNOW(cl)
+  
+  # creating a progress bar to track how far along we have gotten 
+  pb <- txtProgressBar(max = n_boots, style = 3)
+  opts <- list(progress = function(n) setTxtProgressBar(pb, n))
+  
+  # Export workspace variables 
+  vars_to_export <- c("data", "cause_idx", "alpha_val", "node_names", "target_indices", "n_targets", "n_obs")
+  
+  clusterEvalQ(cl, {
+    source("lv-ida/lvida.R") 
+    source("lv-ida/iscyclic.R")
+    library(pcalg)
+    library(graph)
+  })
+  
+  message(paste("Processing", n_boots, "bootstraps on", n_cores, "cores..."))
+  
+  # Parallel bootstrap Loop
+  boot_results <- foreach( 
+    b = 1:n_boots, 
+    .packages = c("pcalg", "graph", "methods"), # Packages for each worker
+    .export = vars_to_export, 
+    .options.snow = opts # Show progress 
+  ) %dopar% {
+    
+    # Resample Data
+    boot_indices <- sample.int(n_obs, n_obs, replace = TRUE) 
+    boot_data <- data[boot_indices, ] 
+    suffStat <- list(C = cor(boot_data, use = "pairwise.complete.obs"), n = n_obs)
+    mcov <- cov(boot_data, use = "pairwise.complete.obs") # Cov matrix 
+    
+    # Estimate PAG
+    pag_est <- tryCatch({
+      rfci(suffStat, indepTest = gaussCItest, alpha = alpha_val, 
+           labels = node_names, verbose = FALSE, m.max = 4)
+    }, error = function(e) return(NULL)) # Skip is estimation fails
+    
+    if (is.null(pag_est)) return(NULL) # Skip if RFCI fails
+    
+    amat <- pag_est@amat # Get amat
+    
+    is_cyclic <- is.cyclic(amat)
+    
+    if (is_cyclic) return(NULL)
+    
+    # Calculating causal effects
+    row_eff <- numeric(n_targets) # Matrix for row effects
+    descendants <- pcalg::possibleDe(amat, cause_idx)
+    
+    # Only check nodes reachable from the cause
+    active_targets <- intersect(target_indices, descendants)
+    
+    if (length(active_targets) > 0) {
+      for (target_idx in active_targets) {
+        
+        out_pos <- if(target_idx < cause_idx) target_idx else target_idx - 1
+        
+        effs <- lv.ida(cause_idx, target_idx, mcov, amat, method = "local")
+        
+        # Take the median for bootstrap
+        if (!all(is.na(effs)) && length(effs) > 0) {
+          row_eff[out_pos] <- median(effs, na.rm = TRUE)
+        }
+      }
+    }
+    return(row_eff)
+  }
+  
+  close(pb)
+  stopCluster(cl)
+  
+  # Aggregate results and do CI calculation, filter out failed bootstraps
+  valid_results <- boot_results[!sapply(boot_results, is.null)]
+  n_valid <- length(valid_results)
+  message(paste("\nSuccessful Bootstraps:", n_valid, "/", n_boots))
+  
+  # Creating effect matrix 
+  eff_matrix <- do.call(cbind, valid_results)
+  
+  # Stat compute helper (non-zero causal paths)
+  compute_stats <- function(row) {
+    causal_vals <- row[row != 0]
+    if (length(causal_vals) == 0) return(c(0, 0, 0))
+    
+    c(median(causal_vals), 
+      quantile(causal_vals, 0.025), 
+      quantile(causal_vals, 0.975))
+  }
+  
+  stats_data <- t(apply(eff_matrix, 1, compute_stats))
+  
+  final_summary <- data.frame(
+    Target_Gene   = potential_targets,
+    Alpha         = alpha_val,
+    Stability_Pct = (rowSums(eff_matrix != 0) / n_valid) * 100,
+    Median_Effect = stats_data[, 1],
+    CI_Lower      = stats_data[, 2],
+    CI_Upper      = stats_data[, 3]
+  )
+  
+  # Save 
+  write.csv(final_summary, csv_name, row.names = FALSE)
+  return(final_summary)
+}
+
+# Run
+resultsasthma <- estimate_downstream_effects_safe_parallel(X_asthma_stable, "MAP3K5-AS2", n_boots = 100, "asthma lvida.csv")
+resultsnorm <- estimate_downstream_effects_safe_parallel(X_normal_stable, "MAP3K5-AS2", n_boots = 100, "normal lvida.csv")
+resultsfull <- estimate_downstream_effects_safe_parallel(X_filtered_stable, "MAP3K5-AS2", n_boots = 100, "overall ida.csv")
 ```
 
 Compare LV-IDA results between asthma and normal children with Welch's t-test
@@ -355,26 +490,59 @@ merged_df <- inner_join(
   suffix = c("_Asthma", "_Normal")
 )
 
-# Welch's t-test
-t_test_result <- t.test(merged_df$Median_Effect_Asthma, 
-                        merged_df$Median_Effect_Normal, 
-                        var.equal = FALSE)
-
-p_val <- t_test_result$p.value
-
-merged_df$Global_P_Value <- sprintf("%.3f", p_val)
-
 # Table
 final_table <- merged_df |>
-  select(Target_Gene, Median_Effect_Asthma_Str, Median_Effect_Normal_Str, Global_P_Value) |>
+  select(Target_Gene, Median_Effect_Asthma_Str, Median_Effect_Normal_Str) |>
   rename(
     Median_Effect_Asthma = Median_Effect_Asthma_Str,
     Median_Effect_Normal = Median_Effect_Normal_Str
   )
 
-print(head(final_table))
-write.csv(final_table, "asthma_normal_with_pvalue.csv", row.names = FALSE)
+write.csv(final_table, "asthma_vs_normal.csv", row.names = FALSE)
 ```
+
+Make that table nicer
+
+```{r}
+nicetable <- final_table |>
+  gt() |>
+  
+  # Title
+  tab_header(
+    title = md("**Differential Effect Analysis**"),
+    subtitle = "Comparison of Median Effects between Asthma and Normal Groups"
+  ) |>
+  
+  # Rename
+  cols_label(
+    Target_Gene = "Target Gene",
+    Median_Effect_Asthma = "Asthma Group",
+    Median_Effect_Normal = "Normal Group"
+  ) |>
+  
+  # Align
+  cols_align(
+    align = "center",
+    columns = c(Median_Effect_Asthma, Median_Effect_Normal)
+  ) |>
+  
+  # Footnotes and style 
+  tab_footnote(
+    footnote = "Values displayed as Median (95% Confidence Interval).",
+    locations = cells_column_labels(columns = c(Median_Effect_Asthma, Median_Effect_Normal))
+  ) |>
+
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = Target_Gene)
+  )
+
+# Save
+print(nicetable)
+
+gtsave(nicetable, "nicetable.png")
+```
+
 
 Try running IDA at alpha = 0.01 to get some results to compare to (turns out this doesn't work; there are no valid CPDAGs produced at each iteration)
 
